@@ -15,6 +15,7 @@ __pycache__/
 # Données volumineuses (régénérables par script)
 data/raw/
 data/index/
+data/processed/*.parquet
 
 # OS / IDE
 .DS_Store

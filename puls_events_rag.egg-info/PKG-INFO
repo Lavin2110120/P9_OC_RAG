@@ -1,0 +1,94 @@
+Metadata-Version: 2.4
+Name: puls-events-rag
+Version: 0.1.0
+Summary: POC d'un chatbot RAG (LangChain + Mistral + FAISS) sur les événements culturels Open Agenda
+Author-email: Ton Nom <ton.email@example.com>
+License: MIT
+Requires-Python: <3.13,>=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: langchain<2.0,>=1.0
+Requires-Dist: langchain-community<1.0,>=0.4
+Requires-Dist: langchain-mistralai<2.0,>=1.0
+Requires-Dist: langchain-text-splitters<2.0,>=1.0
+Requires-Dist: mistralai<2.0,>=1.9
+Requires-Dist: faiss-cpu<2.0,>=1.9
+Requires-Dist: numpy<3.0,>=1.26
+Requires-Dist: fastapi<1.0,>=0.115
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
+Requires-Dist: pydantic<3.0,>=2.7
+Requires-Dist: requests<3.0,>=2.32
+Requires-Dist: pandas<3.0,>=2.2
+Requires-Dist: beautifulsoup4<5.0,>=4.12
+Requires-Dist: python-dotenv<2.0,>=1.0
+Provides-Extra: local-embeddings
+Requires-Dist: langchain-huggingface<2.0,>=1.0; extra == "local-embeddings"
+Requires-Dist: sentence-transformers<6.0,>=3.0; extra == "local-embeddings"
+Provides-Extra: dev
+Requires-Dist: pytest<9.0,>=8.0; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"
+Requires-Dist: httpx<1.0,>=0.27; extra == "dev"
+Requires-Dist: ragas<1.0,>=0.2; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
+Requires-Dist: ipykernel>=6.29; extra == "dev"
+Provides-Extra: all
+Requires-Dist: puls-events-rag[dev,local-embeddings]; extra == "all"
+
+# Puls-Events — Assistant RAG de recommandation d'événements culturels
+
+POC d'un chatbot qui répond aux questions sur les événements culturels
+(source : API Open Agenda) grâce à un système RAG : LangChain + Mistral + FAISS.
+
+## Objectifs
+- Démontrer la faisabilité technique d'un chatbot RAG
+- Exposer le système via une API REST (FastAPI)
+- Évaluer la qualité des réponses sur un jeu de test annoté
+
+## Structure du projet
+```
+├── api/            # API FastAPI (endpoints /ask, /rebuild)
+├── scripts/        # Collecte, nettoyage, construction de l'index
+├── src/rag/        # Logique RAG (retriever, prompt, chaîne)
+├── data/           # Données brutes, nettoyées et index FAISS (non versionnés)
+├── tests/          # Tests unitaires et évaluation
+├── docs/           # Rapport technique et présentation
+├── notebooks/      # Explorations
+├── .env.example    # Modèle des variables d'environnement
+└── requirements.txt
+```
+
+## Installation
+
+### Prérequis
+- Python 3.11 ou 3.12
+- Une clé API Mistral (https://console.mistral.ai)
+
+### Étapes
+```bash
+git clone <url-du-repo>
+cd puls-events-rag
+
+python -m venv env
+source env/bin/activate        # Windows : env\Scripts\activate
+
+pip install --upgrade pip
+pip install -r requirements.txt
+
+cp .env.example .env           # puis renseigner les clés API
+python scripts/check_env.py    # vérifie l'installation
+```
+
+## Note sur les versions
+Les imports historiques (`langchain.vectorstores`, `langchain.embeddings`,
+`MistralClient`) sont obsolètes dans les versions actuelles. Ce projet utilise :
+- `langchain_community.vectorstores.FAISS`
+- `langchain_huggingface.HuggingFaceEmbeddings`
+- `mistralai.Mistral` (SDK v1)
+
+## Utilisation
+| Observation | Conséquence |
+|---|---|
+| Mots-clés **très hétérogènes** : lieux (`La Vapeur`, `Dijon`), genres (`Rock`, `Rap`), thèmes (`Prévention santé`, `Retraite`), noms de campagnes (`Mai à vélo`, `ASEPT FC/B`) | Impossible de s'en servir tels quels comme « type d'événement » |
+| **Casse incohérente** : `Dijon`/`dijon`, `Concert`/`concert`, `La Vapeur`/`la vapeur` | Normaliser avant tout comptage |
+| Volume faible : le top 1 = 51 occurrences | Probablement **quelques centaines d'événements au plus**, dominés par la salle La Vapeur et des actions de prévention santé |
+| **Je ne connais pas la part d'événements sans mots-clés** | Tu n'as collé que la liste, pas le premier chiffre de la commande. Il me le faut avant de trancher définitivement |
+
