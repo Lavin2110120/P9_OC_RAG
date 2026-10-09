@@ -1,98 +1,97 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import faiss
-import numpy as np
-import pandas as pd
-from sentence_transformers import SentenceTransformer
-from pathlib import Path
-from typing import List, Optional
 import logging
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="Puls-Events RAG API",
-    description="API de recherche sémantique pour les événements culturels (Open Agenda).",
-    version="1.0.0"
-)
-
-# CORS (pour le frontend)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST"],
-    allow_headers=["*"],
-)
+import pandas as pd
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # --- Configuration ---
-INDEX_PATH = Path("data/vector_store/faiss_index.bin")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+INDEX_PATH = Path("data/vector_store")
 METADATA_PATH = Path("data/vector_store/metadata.parquet")
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
+MODEL_NAME = "BAAI/bge-m3"  # Modèle multilingue pour les embeddings
 
-# Charger les ressources au démarrage
-try:
-    if not INDEX_PATH.exists():
-        raise FileNotFoundError(f"Index FAISS introuvable : {INDEX_PATH}")
-    if not METADATA_PATH.exists():
-        raise FileNotFoundError(f"Métadonnées introuvables : {METADATA_PATH}")
+# Chargement des ressources au démarrage
+index = None
+metadata_df = None
 
-    index = faiss.read_index(str(INDEX_PATH))
-    metadata = pd.read_parquet(METADATA_PATH)
-    model = SentenceTransformer(MODEL_NAME)
-    log.info("✅ Ressources chargées avec succès.")
-except Exception as e:
-    log.error(f"❌ Erreur au démarrage : {e}")
-    raise
+def load_resources():
+    """Charge l'index FAISS et les métadonnées au démarrage de l'API."""
+    global index, metadata_df
 
-# --- Modèles Pydantic ---
-class EventResult(BaseModel):
-    title: str
-    date: str
-    location: Optional[str] = "N/A"
-    distance: float
-
-class QueryRequest(BaseModel):
-    query: str = Field(..., description="Requête de recherche (ex: 'concert à La Vapeur').")
-    k: int = Field(3, ge=1, le=10, description="Nombre de résultats à retourner.")
-
-# --- Endpoints ---
-@app.post("/search", response_model=dict)
-def search_events(request: QueryRequest):
-    """Recherche des événements similaires à la requête."""
     try:
-        # Vectoriser la requête
-        query_embedding = model.encode(
-            [request.query],
-            normalize_embeddings=True,
-            batch_size=1
-        ).astype('float32')
+        # Chargement des embeddings (modèle multilingue)
+        embeddings = HuggingFaceEmbeddings(
+            model_name=MODEL_NAME,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True}
+        )
 
-        # Recherche FAISS
-        D, I = index.search(query_embedding, k=request.k)
+        # Chargement de l'index FAISS
+        index = FAISS.load_local(
+            folder_path=str(INDEX_PATH),
+            embeddings=embeddings,
+            index_name="faiss_index",
+            allow_dangerous_deserialization=True  # Nécessaire pour charger un index local
+        )
 
-        # Formater les résultats
-        results = []
-        for dist, idx in zip(D[0], I[0]):
-            event = metadata.iloc[idx]
-            results.append({
-                "title": event["title"],
-                "date": str(event["date_begin"]),
-                "location": event.get("location_name", "N/A"),
-                "distance": float(dist)
-            })
+        # Chargement des métadonnées
+        metadata_df = pd.read_parquet(METADATA_PATH)
 
-        return {
-            "query": request.query,
-            "results": results,
-            "count": len(results)
-        }
+        logger.info("✅ Ressources chargées avec succès.")
     except Exception as e:
-        log.error(f"❌ Erreur lors de la recherche : {e}")
+        logger.error(f"❌ Erreur lors du chargement des ressources : {e}")
+        raise
+
+# Initialisation de l'API
+app = FastAPI(title="RAG API pour Open Agenda")
+load_resources()
+
+# Modèle de requête
+class QueryRequest(BaseModel):
+    query: str
+    k: int = 3  # Nombre de résultats par défaut
+
+@app.get("/health")
+def health_check():
+    """Vérifie que l'API est opérationnelle."""
+    return {"status": "OK", "index_size": len(metadata_df) if metadata_df is not None else 0}
+
+@app.post("/search")
+def search_events(request: QueryRequest):
+    """
+    Recherche des événements similaires à la requête en utilisant FAISS.
+    Retourne les k résultats les plus pertinents avec leurs métadonnées.
+    """
+    if index is None:
+        raise HTTPException(status_code=500, detail="Index FAISS non chargé.")
+
+    try:
+        # Recherche dans l'index FAISS
+        docs_and_scores = index.similarity_search_with_score(
+            request.query,
+            k=request.k
+        )
+
+        # Extraction des métadonnées pour chaque résultat
+        results = []
+        for doc, score in docs_and_scores:
+            # Récupération des métadonnées du chunk (via son ID)
+            chunk_id = doc.metadata.get("chunk_id", "")
+            chunk_data = metadata_df[metadata_df["chunk_id"] == chunk_id].iloc[0].to_dict()
+
+            # Ajout du score de similarité
+            chunk_data["score"] = float(score)
+            results.append(chunk_data)
+
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la recherche : {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Pour le développement ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

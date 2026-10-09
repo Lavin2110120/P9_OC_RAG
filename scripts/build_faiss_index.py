@@ -1,134 +1,125 @@
-# scripts/build_faiss_index.py
-import logging
-from pathlib import Path
-from typing import Tuple
 import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
-import faiss
+import logging
+from pathlib import Path
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.docstore.document import Document
 
-# --- CONFIGURATION ---
-INPUT_FILE = Path("data/processed/chunks.parquet")
-VECTOR_STORE_DIR = Path("data/vector_store")
-VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-EMBEDDING_DIM = 384  # Doit correspondre à la dimension du modèle
-BATCH_SIZE = 32
+# Chemins des fichiers
+CHUNKS_PATH = Path("data/processed/chunks.parquet")
+INDEX_DIR = Path("data/vector_store")
+METADATA_PATH = INDEX_DIR / "metadata.parquet"
+INDEX_NAME = "faiss_index"
 
+# Configuration des embeddings
+MODEL_NAME = "BAAI/bge-m3"  # Modèle multilingue (meilleur pour le français)
+EMBEDDING_DEVICE = "cpu"  # Utiliser "cuda" si GPU disponible
+NORMALIZE_EMBEDDINGS = True  # Normaliser les vecteurs pour une meilleure similarité
 
-INDEX_FILE = VECTOR_STORE_DIR / "faiss_index.bin"
-METADATA_FILE = VECTOR_STORE_DIR / "metadata.parquet"
+def load_chunks() -> pd.DataFrame:
+    """Charge les chunks depuis le fichier Parquet."""
+    if not CHUNKS_PATH.exists():
+        raise FileNotFoundError(f"Fichier {CHUNKS_PATH} introuvable. Exécutez d'abord `chunks_events.py`.")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-log = logging.getLogger(__name__)
+    df = pd.read_parquet(CHUNKS_PATH)
 
-def load_data() -> pd.DataFrame:
-    """Charge les chunks ou les événements."""
-    if not INPUT_FILE.exists():
-        raise FileNotFoundError(f"Fichier introuvable : {INPUT_FILE}")
-
-    df = pd.read_parquet(INPUT_FILE)
+    # Vérification des données
+    if df.empty:
+        raise ValueError("Aucun chunk trouvé dans le fichier. Vérifiez `chunks_events.py`.")
     if "text" not in df.columns:
-        if "description" not in df.columns:
-            raise ValueError("Ni 'text' ni 'description' trouvés dans les données.")
-        df["text"] = df["description"]
+        raise ValueError("Le champ 'text' est manquant dans les chunks.")
+    if "chunk_id" not in df.columns:
+        raise ValueError("Le champ 'chunk_id' est manquant dans les chunks.")
+
+    logger.info(f"✅ Chargés {len(df)} chunks depuis {CHUNKS_PATH}.")
     return df
 
-def build_index(df: pd.DataFrame) -> Tuple[faiss.Index, pd.DataFrame]:
-    """Génère les embeddings et construit un index FAISS adapté à la taille des données."""
-    # Charger le modèle
-    log.info(f"Chargement du modèle {EMBEDDING_MODEL}...")
-    model = SentenceTransformer(EMBEDDING_MODEL)
+def build_faiss_index(df: pd.DataFrame) -> tuple:
+    """
+    Construit un index FAISS à partir des chunks et sauvegarde :
+    - L'index FAISS (`faiss_index` dans `INDEX_DIR`).
+    - Les métadonnées associées (`metadata.parquet`).
+    Retourne l'index et le DataFrame des métadonnées.
+    """
+    # Préparation des documents LangChain
+    documents = []
+    for _, row in df.iterrows():
+        metadata = {
+            "chunk_id": row["chunk_id"],
+            "uid": row["uid"],
+            "title": row.get("title", ""),
+            "date_begin": str(row.get("date_begin", "")),
+            "date_end": str(row.get("date_end", "")),
+            "location_name": row.get("location_name", ""),
+            "city": row.get("city", ""),
+            "address": row.get("address", ""),
+            "categories": row.get("categories", []),
+        }
+        documents.append(Document(page_content=row["text"], metadata=metadata))
 
-    # Générer les embeddings par lots
-    embeddings = []
-    for i in range(0, len(df), BATCH_SIZE):
-        batch = df.iloc[i:i+BATCH_SIZE]["text"].tolist()
-        batch_embeddings = model.encode(
-            batch,
-            normalize_embeddings=True,
-            batch_size=BATCH_SIZE,
-            show_progress_bar=True
-        )
-        embeddings.append(batch_embeddings)
+    # Initialisation des embeddings (modèle multilingue)
+    embeddings = HuggingFaceEmbeddings(
+        model_name=MODEL_NAME,
+        model_kwargs={"device": EMBEDDING_DEVICE},
+        encode_kwargs={"normalize_embeddings": NORMALIZE_EMBEDDINGS}
+    )
 
-    embeddings = np.vstack(embeddings).astype('float32')
-    log.info(f"✅ {len(embeddings)} embeddings générés (dimension: {embeddings.shape[1]}).")
+    # Création de l'index FAISS
+    index = FAISS.from_documents(
+        documents=documents,
+        embedding=embeddings,
+        index_name=INDEX_NAME
+    )
 
-    # Vérifier la dimension
-    if embeddings.shape[1] != EMBEDDING_DIM:
-        raise ValueError(
-            f"Dimension des embeddings ({embeddings.shape[1]}) != EMBEDDING_DIM ({EMBEDDING_DIM}). "
-            f"Mettez à jour EMBEDDING_DIM ou changez de modèle."
-        )
-    
-    if len(embeddings) < 1000:  # Seuil pour basculer sur IndexFlatL2
-        log.info("🔹 Utilisation de IndexFlatL2 (dataset trop petit pour IVF).")
-        index = faiss.IndexFlatL2(EMBEDDING_DIM)
-    else:
-        # Pour les grands datasets, utilisez IVF avec nlist adapté
-        nlist = min(100, len(embeddings) // 10)  # nlist = 10% de la taille (ex: 100 pour 1000 vecteurs)
-        log.info(f"🔹 Entraînement IVF avec nlist={nlist}.")
-        quantizer = faiss.IndexFlatL2(EMBEDDING_DIM)
-        index = faiss.IndexIVFFlat(quantizer, EMBEDDING_DIM, nlist, faiss.METRIC_L2)
-        index.train(embeddings)  # Entraînement avec TOUS les vecteurs
+    # Sauvegarde de l'index
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    index.save_local(folder_path=str(INDEX_DIR), index_name=INDEX_NAME)
+    logger.info(f"✅ Index FAISS sauvegardé dans {INDEX_DIR / INDEX_NAME}.")
 
-    # Ajout des vecteurs (commun aux deux cas)
-    index.add(embeddings)
-    log.info(f"✅ {index.ntotal} vecteurs ajoutés à l'index.")
+    # Sauvegarde des métadonnées
+    df.to_parquet(METADATA_PATH)
+    logger.info(f"✅ Métadonnées sauvegardées dans {METADATA_PATH}.")
 
-    # Sauvegarde
-    faiss.write_index(index, str(INDEX_FILE))
-    df.to_parquet(METADATA_FILE)
     return index, df
 
-def verify_index(index: faiss.Index, df: pd.DataFrame) -> None:
+def verify_index(index, metadata_df: pd.DataFrame):
     """Vérifie l'intégrité de l'index FAISS."""
-    # 1. Vérifier la taille
-    if index.ntotal != len(df):
-        raise ValueError(
-            f"Incohérence : {index.ntotal} vecteurs dans FAISS vs {len(df)} dans les métadonnées."
-        )
-    log.info(f"✅ Taille cohérente : {index.ntotal} entrées.")
+    # Vérification de la taille
+    if len(index.docstore._dict) != len(metadata_df):
+        raise ValueError(f"Incohérence : {len(index.docstore._dict)} entrées dans l'index vs {len(metadata_df)} métadonnées.")
 
-    # 2. Vérifier que les vecteurs ne sont pas nuls
-    sample_indices = np.random.choice(index.ntotal, min(10, index.ntotal), replace=False).astype(np.int64).tolist()
-    sample_vectors = np.array([index.reconstruct(i) for i in sample_indices])
-    if np.any(np.isnan(sample_vectors)):
-        raise ValueError("❌ Certains vecteurs contiennent des NaN.")
-    log.info("✅ Aucun vecteur NaN détecté.")
+    # Test de recherche
+    test_query = "concert à Dijon"
+    try:
+        results = index.similarity_search(test_query, k=3)
+        logger.info(f"✅ Recherche de test réussie pour '{test_query}' (top 3 résultats).")
+        for i, doc in enumerate(results, 1):
+            logger.info(f"  {i}. {doc.metadata.get('title', 'Sans titre')} (score: {doc.metadata.get('score', 'N/A')})")
+    except Exception as e:
+        logger.error(f"❌ Échec de la recherche de test : {e}")
+        raise
 
-    # 3. Tester une recherche basique
-    test_query = "test"
-    test_embedding = np.random.rand(1, EMBEDDING_DIM).astype('float32')
-    faiss.normalize_L2(test_embedding)
-    D, I = index.search(test_embedding, k=1)
-    if D[0][0] < 0:
-        raise ValueError("❌ Distance négative détectée (problème de normalisation).")
-    log.info("✅ Recherche de test réussie.")
+def main():
+    """Pipeline complet : chargement des chunks, construction de l'index, vérification."""
+    try:
+        # Chargement des chunks
+        df_chunks = load_chunks()
 
-def test_index(index: faiss.Index, metadata_df: pd.DataFrame, query: str = "concert à La Vapeur") -> None:
-    """Teste une requête sur l'index."""
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    query_embedding = model.encode([query], normalize_embeddings=True)
+        # Construction de l'index FAISS
+        index, metadata_df = build_faiss_index(df_chunks)
 
-    D, I = index.search(query_embedding, k=3)
-    print(f"\n🔍 Requête: '{query}'\n")
-    for i, (dist, idx) in enumerate(zip(D[0], I[0])):
-        event = metadata_df.iloc[idx]
-        date_str = event["date_begin"].strftime('%Y-%m-%d') if pd.notna(event["date_begin"]) else "N/A"
-        print(f"{i+1}. {event['title']} (le {date_str}) - Distance: {dist:.4f}")
+        # Vérification de l'index
+        verify_index(index, metadata_df)
+
+        logger.info("✅ Pipeline terminé avec succès !")
+    except Exception as e:
+        logger.error(f"❌ Erreur fatale : {e}")
+        raise
 
 if __name__ == "__main__":
-    try:
-        df = load_data()
-        index, metadata = build_index(df)
-        verify_index(index, metadata)  # ✅ Appel de la vérification
-        test_index(index, metadata)
-    except Exception as e:
-        log.error(f"❌ Erreur fatale : {e}")
-        raise
+    main()
