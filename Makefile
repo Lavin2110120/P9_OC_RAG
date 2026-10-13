@@ -1,4 +1,6 @@
-.PHONY: pipeline run chat test evaluate docker-build docker-run clean
+.PHONY: all pipeline run chat test evaluate docker-build docker-run clean
+
+all: pipeline test chat evaluate docker-build docker-run
 
 # 1. Pipeline de données : ingestion, nettoyage, puis indexation
 pipeline:
@@ -8,7 +10,7 @@ pipeline:
 
 # 2. Exécution locale de la API
 run:
-    uvicorn api.main:app --reload
+	uvicorn api.main:app --reload
 
 # 2.5 Test en ligne de commande 
 chat:
