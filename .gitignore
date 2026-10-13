@@ -1,22 +1,46 @@
-# Environnement virtuel
+# Environnements virtuels
 env/
-.venv/
 venv/
+.venv/
+ENV/
 
-# Secrets
+# Fichiers de configuration sensible
 .env
+Dockerfile
+Makefile
+annotated_qa.json
 
 # Python
 __pycache__/
 *.pyc
 .pytest_cache/
 .ipynb_checkpoints/
+src/
+*.py[cod]
 
 # Données volumineuses (régénérables par script)
-data/raw/
-data/index/
-data/processed/*.parquet
+data/
+ragas_evaluation_results.csv
+*.egg-info/
+
+# Documents/rapports
+scripts/files_opener.ipynb
+archives/
+*.docx
+*.pdf
+docs/
 
 # OS / IDE
 .DS_Store
 .vscode/
+.idea/
+
+# Fichiers de logs
+*.log
+
+# Fichiers temporaires
+*.swp
+*.swo
+*~
+
+

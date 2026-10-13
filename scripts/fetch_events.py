@@ -1,169 +1,185 @@
-"""Collecte des événements OpenAgenda (Côte-d'Or) depuis l'API v2."""
-import json
+"""Récupération des événements OpenAgenda autour de Dijon / Côte-d'Or."""
 import logging
-import sys
 import time
-from pathlib import Path
+from datetime import datetime, time as dtime
 
+import pandas as pd
 import requests
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from config import settings
-from config.geo import event_in_zone, agenda_in_zone
+from config import settings, geo
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-def _build_session() -> requests.Session:
+COLUMNS = [
+    "uid", "slug", "title", "description", "long_description", "keywords",
+    "date_begin", "date_end", "location_name", "address", "city", "postal_code",
+    "latitude", "longitude", "agenda_uid", "agenda_title", "online_link",
+]
+
+
+# ---------------------------------------------------------------- HTTP helpers
+def setup_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"User-Agent": settings.USER_AGENT, "key": settings.require_openagenda_key()})
+    session.headers.update({"Accept": "application/json", "User-Agent": settings.USER_AGENT})
     return session
 
-def _get(session: requests.Session, url: str, params=None) -> dict:
-    """GET avec retry réseau/429/5xx, jamais sur les autres 4xx."""
+
+def get_json(session: requests.Session, url: str, params: dict) -> dict | None:
     for attempt in range(1, settings.MAX_RETRIES + 1):
         try:
-            response = session.get(url, params=params, timeout=settings.REQUEST_TIMEOUT)
-        except requests.RequestException as exc:
-            if attempt == settings.MAX_RETRIES:
-                break
-            log.warning("Tentative %d/%d : erreur réseau (%s)", attempt, settings.MAX_RETRIES, type(exc).__name__)
-            time.sleep(settings.RETRY_BACKOFF_BASE ** attempt)
-            continue
-        if response.status_code in (429,) or response.status_code >= 500:
-            if attempt == settings.MAX_RETRIES:
-                break
-            retry_after = response.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else settings.RETRY_BACKOFF_BASE ** attempt
-            log.warning("Tentative %d/%d : HTTP %d, pause %.1fs", attempt, settings.MAX_RETRIES, response.status_code, wait)
+            resp = session.get(url, params=params, timeout=settings.REQUEST_TIMEOUT)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise requests.exceptions.RetryError(f"HTTP {resp.status_code}")
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as exc:
+            # Ne jamais propager l'URL : elle contient la clé API
+            raise requests.exceptions.HTTPError(
+                f"HTTP {exc.response.status_code} sur {url}", response=exc.response
+            ) from None
+        except requests.exceptions.RequestException as exc:
+            wait = settings.RETRY_BACKOFF_BASE ** attempt
+            log.warning(f"Tentative {attempt}/{settings.MAX_RETRIES} échouée "
+                        f"({type(exc).__name__}), retry dans {wait:.0f}s")
             time.sleep(wait)
-            continue
-        if response.status_code in (401, 403):
-            raise PermissionError(f"Accès refusé (HTTP {response.status_code}) : vérifie OPENAGENDA_API_KEY")
-        response.raise_for_status()
+    return None
+
+
+def paginate(session, url, params, key):
+    params = dict(params)
+    items, total = [], None
+    while True:
+        data = get_json(session, url, params)
+        if not data:
+            break
+        batch = data.get(key, [])
+        items.extend(batch)
+        total = data.get("total", total)
+        after = data.get("after")
+        if not batch or not after:
+            break
+        params["after[]"] = after
         time.sleep(settings.REQUEST_DELAY)
-        return response.json()
-    raise RuntimeError(f"Échec après {settings.MAX_RETRIES} tentatives : {url}")
+    if total is not None and len(items) < total:
+        log.warning(f"Pagination incomplète : {len(items)}/{total}")
+    return items
 
-def _with_cursor(params: dict, after):
-    if after:
-        params["after[]" if isinstance(after, list) else "after"] = after
-    return params
 
-def search_agendas(session: requests.Session, query: str) -> list[dict]:
-    agendas, after = [], None
-    while True:
-        data = _get(session, f"{settings.OPENAGENDA_BASE_URL}/agendas",
-                    _with_cursor({"search": query, "size": 50}, after))
-        batch = data.get("agendas", [])
-        agendas.extend(batch)
-        after = data.get("after")
-        if not batch or not after:
-            return agendas
+# ---------------------------------------------------------------- Fetch
+def event_params() -> dict:
+    bbox = settings.GEO_BBOX
+    return {
+        "key": settings.OPENAGENDA_API_KEY,
+        "size": settings.PAGE_SIZE,
+        "detailed": 1,
+        "timings[gte]": datetime.combine(settings.DATE_MIN, dtime.min).isoformat(),
+        "timings[lte]": datetime.combine(settings.DATE_MAX, dtime.max).isoformat(),
+        "geo[northEast][lat]": bbox["north"],
+        "geo[northEast][lng]": bbox["east"],
+        "geo[southWest][lat]": bbox["south"],
+        "geo[southWest][lng]": bbox["west"],
+    }
 
-def select_agendas(agendas: list[dict]) -> list[dict]:
-    """Dédoublonne, applique la liste blanche et filtre géographiquement."""
-    whitelist = [str(v).casefold() for v in getattr(settings, "AGENDA_WHITELIST", []) if v]
-    selected = {}
-    for agenda in agendas:
-        title = str(agenda.get("title") or "")
-        if not whitelist or any(item in title.casefold() for item in whitelist):
-            if agenda.get("uid") is not None:
-                # 👇 FILTRE GÉOGRAPHIQUE STRICT : on vérifie la ville ET le département
-                location = agenda.get("location", {})
-                city = location.get("city", "").casefold()
-                department = location.get("department", "").casefold()
 
-                # Villes cibles en Côte-d'Or (21)
-                target_cities = {"dijon", "beaune", "auxonne", "montbard", "semur-en-auxois",
-                                "châtillon-sur-seine", "nuits-saint-georges"}
-                target_dept = "21"
+def fetch_global_events(session: requests.Session) -> list[dict]:
+    """Endpoint global : tous les événements de la plateforme dans la bounding box."""
+    url = f"{settings.OPENAGENDA_BASE_URL}/events"
+    return paginate(session, url, event_params(), key="events")
 
-                # Si la ville est dans la liste OU le département est 21
-                if (city in target_cities) or (department == target_dept):
-                    selected[agenda["uid"]] = agenda
-                else:
-                    log.debug(f"Agenda {title} ignoré : ville={city}, département={department}")
-    return list(selected.values())
 
-def fetch_agenda_events(session: requests.Session, agenda_uid: int) -> list[dict]:
-    events, after = [], None
-    while True:
-        params = _with_cursor({"size": settings.PAGE_SIZE, "detailed": 1,
-                               "monolingual": "fr", "timings[gte]": settings.DATE_MIN.isoformat(),
-                               "timings[lte]": settings.DATE_MAX.isoformat()}, after)
-        data = _get(session, f"{settings.OPENAGENDA_BASE_URL}/agendas/{agenda_uid}/events", params)
-        batch = data.get("events", [])
-        events.extend(batch)
-        after = data.get("after")
-        if not batch or not after:
-            return events
+def fetch_agenda_list(session: requests.Session) -> list[dict]:
+    """Fallback : découverte des agendas par mots-clés."""
+    url = f"{settings.OPENAGENDA_BASE_URL}/agendas"
+    agendas: dict = {}
+    for query in settings.AGENDA_QUERIES:
+        params = {"key": settings.OPENAGENDA_API_KEY, "size": settings.PAGE_SIZE, "search": query}
+        for agenda in paginate(session, url, params, key="agendas"):
+            agendas[agenda["uid"]] = agenda
+    return list(agendas.values())
 
-def main() -> None:
+
+def fetch_agenda_events(session: requests.Session, agenda_uid) -> list[dict]:
+    url = f"{settings.OPENAGENDA_BASE_URL}/agendas/{agenda_uid}/events"
+    return paginate(session, url, event_params(), key="events")
+
+
+def fetch_all_events(session: requests.Session) -> list[dict]:
     try:
-        session = _build_session()
-        candidates = {}
-        for query in settings.AGENDA_QUERIES:
-            for agenda in search_agendas(session, query):
-                if agenda.get("uid") is not None:
-                    candidates[agenda["uid"]] = agenda
+        events = fetch_global_events(session)
+        log.info(f"Endpoint global : {len(events)} événements dans la bounding box")
+        return events
+    except requests.exceptions.HTTPError as exc:
+        log.warning(f"Endpoint global indisponible ({exc}), bascule sur la découverte d'agendas")
 
-        # 👇 FILTRE GÉOGRAPHIQUE AVANT RÉCUPÉRATION DES ÉVÉNEMENTS
-        agendas = select_agendas(list(candidates.values()))
-        log.info("Filtre géographique appliqué : %d agendas retenus sur %d candidats",
-                len(agendas), len(candidates))
+    def is_excluded_agenda(agenda: dict) -> bool:
+        title = geo._norm(agenda.get("title"))
+        return any(kw in title for kw in settings.AGENDA_EXCLUDE_KEYWORDS)
 
-    except PermissionError as exc:
-        raise SystemExit(f"❌ {exc}")
-    except (RuntimeError, requests.RequestException) as exc:
-        raise SystemExit(f"❌ Découverte des agendas impossible : {type(exc).__name__}")
-
-    # --- Récupération des événements (seulement pour les agendas filtrés) ---
-    by_uid = {}
-    total_new = total_duplicates = total_outside = 0
-
+    agendas = [a for a in fetch_agenda_list(session) if geo.agenda_in_zone(a) and not is_excluded_agenda(a)]
+    log.info(f"{len(agendas)} agendas retenus")
+    events = []
     for agenda in agendas:
         try:
-            events = fetch_agenda_events(session, agenda["uid"])
-        except (RuntimeError, PermissionError, requests.RequestException) as exc:
-            log.error("Agenda %s ignoré : %s", agenda.get("title"), type(exc).__name__)
+            found = fetch_agenda_events(session, agenda["uid"])
+        except requests.exceptions.HTTPError as exc:
+            log.warning(f"  • {agenda.get('title')} : erreur {exc}")
             continue
+        log.info(f"  • {agenda.get('title')} : {len(found)} récupérés")
+        events.extend(found)
+    return events
 
-        new = duplicates = outside = 0
-        for event in events:
-            uid = event.get("uid")
-            if uid in by_uid:
-                by_uid[uid].setdefault("_agendas", []).append(agenda.get("title"))
-                duplicates += 1
-                continue
 
-            # 👇 FILTRE GÉOGRAPHIQUE STRICT SUR LES ÉVÉNEMENTS
-            if settings.ENABLE_GEO_FILTER and not event_in_zone(event):
-                outside += 1
-                log.debug("Événement %s rejeté : hors zone", uid)
-                continue
+def _lang(value, lang: str = settings.LANG):
+    """Les champs texte OpenAgenda sont multilingues : {'fr': '...', 'en': '...'}."""
+    if isinstance(value, dict):
+        return value.get(lang) or next((v for v in value.values() if v), "")
+    return value or ""
 
-            event["_agenda_title"] = agenda.get("title")
-            event["_agendas"] = [agenda.get("title")]
-            by_uid[uid] = event
-            new += 1
 
-        total_new += new
-        total_duplicates += duplicates
-        total_outside += outside
+def extract_event_data(event: dict) -> dict:
+    first = event.get("firstTiming") or (event.get("timings") or [{}])[0] or {}
+    last = event.get("lastTiming") or first
+    location = event.get("location") or {}
+    agenda = event.get("originAgenda") or {}
+    keywords = _lang(event.get("keywords"))
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in keywords.split(",") if k.strip()]
 
-        if events:
-            log.info("  • %-45s %4d récupérés | %4d nouveaux | %4d doublons | %4d hors zone",
-                    (agenda.get("title") or "")[:45], len(events), new, duplicates, outside)
-        else:
-            log.debug("  • %-45s agenda vide (filtre géographique ?)", (agenda.get("title") or "")[:45])
+    return {
+        "uid": event.get("uid"),
+        "slug": event.get("slug"),
+        "title": _lang(event.get("title")),
+        "description": _lang(event.get("description")),
+        "long_description": _lang(event.get("longDescription")),
+        "keywords": list(keywords or []),
+        "date_begin": first.get("begin"),
+        "date_end": last.get("end"),
+        "location_name": location.get("name"),
+        "address": location.get("address"),
+        "city": location.get("city"),
+        "postal_code": location.get("postalCode"),
+        "latitude": location.get("latitude"),
+        "longitude": location.get("longitude"),
+        "agenda_uid": agenda.get("uid"),
+        "agenda_title": agenda.get("title"),
+        "online_link": event.get("onlineAccessLink"),
+    }
 
-    # Sauvegarde finale
-    all_events = list(by_uid.values())
-    settings.RAW_FILE.write_text(json.dumps(all_events, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info("TOTAL : %d événements uniques sauvegardés dans %s", len(all_events), settings.RAW_FILE)
-    log.info("Statistiques : %d nouveaux | %d doublons | %d hors zone ignorés",
-             total_new, total_duplicates, total_outside)
+
+def main():
+    settings.require_openagenda_key()
+    session = setup_session()
+
+    events = fetch_all_events(session)
+    records = [extract_event_data(e) for e in events if geo.event_in_zone(e)]
+    log.info(f"Filtre géographique : {len(records)} événements retenus sur {len(events)}")
+
+    df = pd.DataFrame(records, columns=COLUMNS).drop_duplicates(subset=["uid"])
+    settings.RAW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(settings.RAW_FILE, index=False)
+    log.info(f"TOTAL : {len(df)} événements uniques sauvegardés dans {settings.RAW_FILE}")
+
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,6 @@
 """Vectorisation des événements avec sentence-transformers et FAISS."""
 import logging
+from config.settings import PROCESSED_FILE
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -7,8 +8,6 @@ from sentence_transformers import SentenceTransformer
 import faiss
 
 # --- CONFIGURATION ---
-# Chemin vers votre fichier Parquet (à adapter si nécessaire)
-PARQUET_FILE = Path("C:/Users/15GIRAV/Moi/Boulot/OpenClassrooms/P9_OC_RAG/data/processed/events.parquet")
 # Dossier de sortie pour l'index vectoriel
 VECTOR_STORE_DIR = Path("data/vector_store")
 # Modèle d'embedding (léger et performant)
@@ -78,7 +77,7 @@ def save_index_and_metadata(index: faiss.Index, df: pd.DataFrame, index_path: Pa
     faiss.write_index(index, str(index_path))
 
     # Sauvegarder uniquement les métadonnées utiles pour le RAG
-    metadata = df[["uid", "title", "date_begin", "location_name", "url", "description"]].copy()
+    metadata = df[["uid", "title", "date_begin", "location_name", "description", "text"]].copy()
     log.info(f"Sauvegarde des métadonnées dans {metadata_path}...")
     metadata.to_parquet(metadata_path)
 
@@ -86,11 +85,12 @@ def save_index_and_metadata(index: faiss.Index, df: pd.DataFrame, index_path: Pa
 def main():
     try:
         # 1. Charger les données
-        df = load_data(PARQUET_FILE)
+        df = load_data(PROCESSED_FILE)
         log.info(f"✅ {len(df)} événements chargés.")
 
-        # 2. Préparer les textes
+        # 2. Préparer les textes et les injecter dans df
         texts = prepare_texts(df)
+        df["text"] = texts
         log.info(f"✅ {len(texts)} textes préparés pour la vectorisation.")
 
         # 3. Générer les embeddings

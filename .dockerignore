@@ -1,0 +1,39 @@
+# Environnements virtuels
+env/
+venv/
+.venv/
+ENV/
+
+# Fichiers de build Python
+*.egg-info/
+DS_OC_Projet9.egg-info/
+puls_events_rag.egg-info/
+
+# Fichiers de cache
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Fichiers de données locales
+data/
+ragas_evaluation_results.csv
+
+# Fichiers de configuration sensible
+.env
+Dockerfile
+Makefile
+
+# Fichiers IDE
+.vscode/
+.idea/
+
+# Fichiers temporaires
+.git/
+.gitignore
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Fichiers de logs
+*.log

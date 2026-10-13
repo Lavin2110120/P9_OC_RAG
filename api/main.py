@@ -1,134 +1,111 @@
-from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
-from scripts.mistral_qa import generate_response
+"""API FastAPI - Orchestration du pipeline événementiel et FAQ RAG."""
 import logging
 import sys
-from dotenv import load_dotenv  
-import os
+import asyncio
+from pathlib import Path
+from typing import Any, Dict
 
-# Chargez les variables d'environnement depuis .env
-load_dotenv()  # <-- Charge le fichier .env
+import uvicorn
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
-# Vérifiez que la clé API est bien chargée
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-if not MISTRAL_API_KEY:
-    raise ValueError("La variable MISTRAL_API_KEY est manquante dans .env ou n'est pas définie.")
+# Permet les imports `config.*` et `scripts.*` depuis la racine du projet,
+# quel que soit le répertoire d'exécution.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# Initialisez le logger
-logging.basicConfig(level=logging.INFO)
+from scripts.fetch_events import main as fetch_events_main
+from scripts.clean_events import main as clean_events_main
+from scripts.vectorize_events import main as vectorize_and_index
+
+# Configuration des logs
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-
-
-# --- Initialisation de l'application FastAPI ---
 app = FastAPI(
-    title="Chatbot RAG pour Événements Culturels",
-    description="API pour interagir avec un chatbot RAG basé sur FAISS et Mistral.",
+    title="Puls Events API",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    description="API de recommandation d'événements culturels avec RAG Mistral/FAISS.",
 )
 
-# --- Modèle de requête ---
+# 1. On crée un verrou global pour l'API
+rebuild_lock = asyncio.Lock()
+
+async def run_full_pipeline_safe():
+    """Tâche de fond protégée par un verrou pour la reconstruction."""
+    # Si le verrou est déjà pris, on annule silencieusement
+    if rebuild_lock.locked():
+        logger.warning("⏳ [Pipeline] Une reconstruction est déjà en cours, annulation de la nouvelle demande.")
+        return
+
+    async with rebuild_lock:
+        logger.info("🔄 [Pipeline] Début de la reconstruction complète de l'index...")
+        try:
+            # Note : Les données sont traitées via le dossier data/processed/
+            fetch_events_main()
+            clean_events_main()
+            vectorize_and_index()
+            logger.info("✅ [Pipeline] Index FAISS reconstruit avec succès !")
+        except Exception as exc:
+            logger.error(f"❌ [Pipeline] Erreur lors de la reconstruction : {exc}", exc_info=True)
+
+
 class QueryRequest(BaseModel):
-    query: str = Field(..., description="Requête utilisateur pour le chatbot.", example="Quels sont les concerts à Dijon en octobre ?")
-    k: Optional[int] = Field(
-        default=3,
-        ge=1,
-        le=10,
-        description="Nombre de résultats à récupérer depuis FAISS (entre 1 et 10).",
-        example=3,
-    )
+    query: str = Field(..., min_length=1, description="Question posée au chatbot")
 
-# --- Endpoint principal pour le chat ---
-@app.post(
-    "/chat",
-    response_model=Dict[str, Any],
-    responses={
-        200: {"description": "Réponse générée avec succès."},
-        400: {"description": "Requête invalide."},
-        500: {"description": "Erreur interne du serveur."},
-    },
-    summary="Interroger le chatbot RAG",
-    description="Génère une réponse augmentée à partir des événements indexés dans FAISS.",
-)
-async def chat(request: QueryRequest):
+_generate_response = None
+
+def get_generate_response():
+    """Charge le module Mistral/FAISS à la première question.
+
+    Import différé volontairement pour permettre à l'API de démarrer
+    (et donc à `/rebuild` de fonctionner) même si l'index FAISS n'existe
+    pas encore sur disque.
     """
-    Endpoint pour interagir avec le chatbot RAG.
+    global _generate_response
+    if _generate_response is None:
+        logger.info("Chargement du module Mistral / FAISS...")
+        from scripts.mistral_qa import generate_response
+        _generate_response = generate_response
+        logger.info("Module Mistral / FAISS initialisé.")
+    return _generate_response
 
-    Args:
-        request (QueryRequest): Requête contenant la question utilisateur et le nombre de résultats souhaités.
+# ==========================================
+# ROUTES DE L'API
+# ==========================================
 
-    Returns:
-        Dict[str, Any]: Réponse générée par le chatbot.
-    """
-    try:
-        logger.info(f"Requête reçue : {request.query} (k={request.k})")
-
-        # Validation supplémentaire : Vérifier que la requête n'est pas vide
-        if not request.query.strip():
-            logger.warning("Requête vide reçue.")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="La requête ne peut pas être vide.",
-            )
-
-        # Génération de la réponse
-        response = generate_response(request.query)
-        logger.info(f"Réponse générée : {response}")
-
-        return {"response": response, "k": request.k}
-
-    except HTTPException as he:
-        logger.error(f"Erreur HTTP : {he.detail}")
-        raise he
-    except Exception as e:
-        logger.error(f"Erreur inattendue lors de la génération de la réponse : {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur interne : {str(e)}",
-        )
-
-# --- Endpoint de santé ---
-@app.get(
-    "/health",
-    response_model=Dict[str, str],
-    summary="Vérifier l'état de l'API",
-    description="Endpoint pour vérifier que l'API est opérationnelle.",
-)
+@app.get("/health", summary="Vérifier l'état de l'API")
 async def health_check():
-    """Vérifie que l'API est en bon état de fonctionnement."""
-    logger.info("Requête de santé reçue.")
     return {"status": "OK", "message": "L'API est opérationnelle."}
 
-# --- Endpoint pour tester la connexion à Mistral ---
-@app.get(
-    "/test-mistral",
-    summary="Tester la connexion à Mistral",
-    description="Vérifie que la connexion à l'API Mistral fonctionne.",
-)
-async def test_mistral():
-    """Teste la connexion à l'API Mistral."""
+@app.post("/ask", summary="Poser une question au chatbot")
+async def ask(request: QueryRequest) -> Dict[str, Any]:
     try:
-        # Appel minimal pour vérifier la connexion
-        test_response = generate_response("Test de connexion.")
-        logger.info(f"Connexion à Mistral validée. Réponse : {test_response[:50]}...")
-        return {"status": "OK", "message": "Connexion à Mistral fonctionnelle."}
-    except Exception as e:
-        logger.error(f"Échec de la connexion à Mistral : {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Échec de la connexion à Mistral : {str(e)}",
-        )
+        logger.info(f"Question reçue : {request.query}")
+        if not request.query.strip():
+            raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
 
-# --- Point d'entrée pour exécuter l'API ---
+        generate_response = get_generate_response()
+        response = generate_response(request.query)
+        return {"question": request.query, "response": response}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la génération : {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erreur interne : {str(e)}")
+
+@app.post("/rebuild", summary="Reconstruire l'index FAISS")
+async def rebuild_index(background_tasks: BackgroundTasks):
+    if rebuild_lock.locked():
+        raise HTTPException(status_code=429, detail="Une reconstruction est déjà en cours.")
+
+    background_tasks.add_task(run_full_pipeline_safe)
+    return {
+        "status": "success",
+        "message": "Reconstruction de l'index lancée en tâche de fond."
+    }
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
-        reload=True,
-    )
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)

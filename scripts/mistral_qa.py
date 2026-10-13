@@ -53,3 +53,15 @@ chain = (
 def generate_response(query: str) -> str:
     """Génère une réponse augmentée pour une requête utilisateur."""
     return chain.invoke(query)
+
+if __name__ == "__main__":
+    print("Initialisation du Chatbot Mistral...")
+    
+    question = "Quels sont les prochains concerts prévus à La Vapeur ?"
+    print(f"\nQuestion : {question}")
+    print("Génération de la réponse en cours...\n")
+    
+    reponse = generate_response(question)
+    
+    print("--- RÉPONSE MISTRAL ---")
+    print(reponse)
