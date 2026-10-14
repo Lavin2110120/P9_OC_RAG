@@ -1,6 +1,12 @@
 import pytest
 from fastapi.testclient import TestClient
 from api.main import app
+import os
+import runpy
+import pytest
+from unittest.mock import patch, MagicMock
+import importlib
+import scripts.mistral_qa
 
 client = TestClient(app)
 
@@ -43,3 +49,24 @@ if __name__ == "__main__":
     print("✅ /rebuild validé")
     test_ask_endpoint_valid()
     print("✅ /ask validé avec succès")
+
+
+def test_mistral_qa_missing_key(monkeypatch):
+    # Supprimer la variable d'environnement
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    # Empêcher load_dotenv de remettre la clé (si .env existe)
+    monkeypatch.setattr("scripts.mistral_qa.load_dotenv", MagicMock())
+    # Forcer os.getenv à retourner None
+    with patch("os.getenv", return_value=None):
+        with pytest.raises(ValueError, match="MISTRAL_API_KEY est requis"):
+            importlib.reload(scripts.mistral_qa)
+
+
+@patch("scripts.mistral_qa.generate_response")
+def test_mistral_qa_main_block(mock_generate_response, capsys):
+    mock_generate_response.return_value = "Réponse mockée"
+    from scripts.mistral_qa import main
+    main()
+    captured = capsys.readouterr()
+    assert "Réponse mockée" in captured.out
+    mock_generate_response.assert_called_once()

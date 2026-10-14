@@ -13,10 +13,10 @@ description = "Projet 9 - Data Scientist OpenClassrooms"
 authors = [{ name = "Lavin", email = "vincentgirardin10120@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
+[project.optional-dependencies]
+core = [
     "pandas>=2.0.0",
     "numpy>=1.24.0",
-    "requests>=2.31.0",
     "pyarrow>=14.0.0",
     "python-dateutil>=2.8.2",
     "pydantic>=2.0.0",
@@ -31,14 +31,24 @@ dependencies = [
     "langchain-core>=0.2.0",
     "langchain-community>=0.4,<0.4.2",
     "langchain-mistralai>=0.1.0",
-    "ollama>=0.1.0",
+    "langchain-huggingface[full]",
     "python-dotenv>=1.0.0",
+]
+dev = [
     "pytest>=7.0.0",
+    "coverage>=7.0.0", 
+    "pytest-cov>=7.0.0",
     "black>=23.0.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
     "datasets",
     "ragas",
+    "mistralai>=1.0,<2",
+    "instructor>=1.4,<2",
+]
+ui = [
+    "streamlit",
+    "requests>=2.31.0",
 ]
 
 [project.scripts]

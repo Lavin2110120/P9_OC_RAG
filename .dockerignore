@@ -15,7 +15,6 @@ __pycache__/
 *.py[cod]
 
 # Fichiers de données locales
-data/
 ragas_evaluation_results.csv
 
 # Fichiers de configuration sensible
@@ -37,3 +36,16 @@ Makefile
 
 # Fichiers de logs
 *.log
+
+# Fichiers de documentation et de présentation
+README.md
+docs/
+*.md
+*.pptx
+
+# Tests
+tests/
+
+# Cache et logs supplémentaires
+*.log
+logs/

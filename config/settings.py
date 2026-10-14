@@ -46,10 +46,10 @@ AGENDA_QUERIES = ["Dijon", "Côte-d'Or", "Beaune", "Auxonne", "Montbard",
                   "Semur-en-Auxois", "Châtillon-sur-Seine", "Nuits-Saint-Georges"]
 AGENDA_KEYWORDS = ["dijon", "cote d'or", "cote-d'or", "bourgogne", "beaune"]
 AGENDA_EXCLUDE_KEYWORDS = ["test", "archives", "[archives]"]
-# --- Fenêtre temporelle : aujourd'hui → +12 mois
+# --- Fenêtre temporelle : aujourd'hui - 1 an → aujourd'hui + 2 ans
 TODAY = date.today()
-DATE_MIN = TODAY
-DATE_MAX = TODAY + timedelta(days=365)
+DATE_MIN = TODAY - timedelta(days=365)
+DATE_MAX = TODAY + timedelta(days=730)
 
 # --- Catégorisation (utilisée par d'autres scripts)
 CATEGORY_KEYWORDS = {

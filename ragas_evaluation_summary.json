@@ -1,0 +1,21 @@
+{
+  "benchmark": "C:\\Users\\Lavin\\Openclassrooms\\Data Scientist\\DS_OC_Projet9\\annotated_qa.json",
+  "rows_total": 3,
+  "rows_scored": 3,
+  "rows_skipped": 0,
+  "metrics": [
+    "faithfulness",
+    "answer_relevancy",
+    "context_precision",
+    "context_recall",
+    "answer_correctness"
+  ],
+  "scores": {
+    "faithfulness": null,
+    "answer_relevancy": null,
+    "context_precision": null,
+    "context_recall": null,
+    "answer_correctness": null
+  },
+  "errors": []
+}

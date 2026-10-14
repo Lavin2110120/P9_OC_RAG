@@ -1,6 +1,6 @@
 .PHONY: all pipeline run chat test evaluate docker-build docker-run clean
 
-all: pipeline test chat evaluate docker-build docker-run
+all: pipeline chat test evaluate docker-build
 
 # 1. Pipeline de données : ingestion, nettoyage, puis indexation
 pipeline:
@@ -30,6 +30,10 @@ docker-build:
 
 docker-run:
 	docker run -p 8000:8000 --env-file .env puls-events-rag
+
+#5. Interface
+streamlit:
+	streamlit run ui/app.py
 
 clean:
 	rm -rf data/vector_store/*
