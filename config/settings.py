@@ -14,6 +14,9 @@ RAW_DIR = ROOT / "data" / "raw"
 RAW_FILE = RAW_DIR / "events_raw.json"
 PROCESSED_DIR = ROOT / "data" / "processed"
 PROCESSED_FILE = PROCESSED_DIR / "events.parquet"
+VECTOR_STORE_DIR = ROOT / "data" / "vector_store"
+INDEX_FILE = VECTOR_STORE_DIR / "faiss_index.bin"
+METADATA_FILE = VECTOR_STORE_DIR / "metadata.parquet"
 
 # --- Clés API
 OPENAGENDA_API_KEY = os.getenv("OPENAGENDA_API_KEY")

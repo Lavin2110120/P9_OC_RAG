@@ -7,10 +7,13 @@ from functools import partial
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_mistralai import ChatMistralAI
 
 from api.faiss_retriever import FAISSRetriever
+import ssl
+import httpx
+import truststore
 
 load_dotenv()
 
@@ -24,6 +27,16 @@ LLM = ChatMistralAI(
     temperature=0.2,
 )
 
+_client = LLM.client
+
+LLM.client = httpx.Client(
+    base_url=_client.base_url,
+    headers=dict(_client.headers),
+    timeout=LLM.timeout,
+    verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+)
+
+_client.close()
 
 def _get_localized_date() -> str:
     try:
@@ -65,7 +78,7 @@ def generate_response(query: str, k: int = 5) -> str:
     retrieve_fn = partial(retriever.retrieve, k=k)
 
     chain = (
-        {"context": retrieve_fn | _format_docs, "question": RunnablePassthrough()}
+        {"context": RunnableLambda(retrieve_fn) | RunnableLambda(_format_docs),"question": RunnablePassthrough(),}
         | PROMPT
         | LLM
         | StrOutputParser()
