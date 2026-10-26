@@ -9,56 +9,87 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "DS_OC_Projet9"
 version = "0.1.0"
-description = "Projet 9 - Data Scientist OpenClassrooms"
-authors = [{ name = "Lavin", email = "vincentgirardin10120@gmail.com" }]
+description = "Projet 9 - Data Scientist OpenClassrooms - RAG Puls-Events Dijon"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lavin", email = "vincentgirardin10120@gmail.com" }]
+
+# Dépendances minimales partagées par tous les groupes (imports universels).
+dependencies = [
+    "python-dotenv>=1.0.0",
+]
+
 [project.optional-dependencies]
+# Dépendances de l'API + scripts du pipeline (fetch/clean/vectorize/faiss/qa).
 core = [
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     "pyarrow>=14.0.0",
     "python-dateutil>=2.8.2",
     "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",
-    "gunicorn>=21.2.0",
-    "beautifulsoup4>=4.12.0",
+    "httpx>=0.27.0",          # requis par fastapi.testclient (TestClient)
+    "beautifulsoup4>=4.12.0", # bs4 — clean_events.clean_html
     "faiss-cpu>=1.7.4",
     "sentence-transformers>=2.2.0",
-    "langchain>=0.2.0",
     "langchain-core>=0.2.0",
-    "langchain-community>=0.4,<0.4.2",
     "langchain-mistralai>=0.1.0",
-    "langchain-huggingface[full]",
-    "python-dotenv>=1.0.0",
 ]
+# Outillage de dev + évaluation RAGAS + tests.
 dev = [
     "pytest>=7.0.0",
-    "coverage>=7.0.0", 
-    "pytest-cov>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "coverage>=7.0.0",
     "black>=23.0.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
-    "datasets",
-    "ragas",
-    "mistralai>=1.0,<2",
-    "instructor>=1.4,<2",
+    "ragas>=0.1.0",            # Faithfulness, AnswerRelevancy, SingleTurnSample
+    "instructor>=1.4,<2",      # dépendance RAGAS (AnswerRelevancy)
 ]
+# Interface Streamlit + client HTTP.
 ui = [
-    "streamlit",
+    "streamlit>=1.30.0",
     "requests>=2.31.0",
+]
+# Regroupements utiles.
+all = [
+    "DS_OC_Projet9[core,dev,ui]",
+]
+api = [
+    "DS_OC_Projet9[core]",
+]
+pipeline = [
+    "DS_OC_Projet9[core]",
 ]
 
 [project.scripts]
 fetch_events = "scripts.fetch_events:main"
 clean_events = "scripts.clean_events:main"
+vectorize_events = "scripts.vectorize_events:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["scripts*", "config*"]
+include = ["api*", "config*", "scripts*", "ui*"]
+exclude = ["tests*"]
 
+# -----------------------------------------------------------------------------
+# Pytest : utilise le Makefile `make test`, mais permet aussi `pytest` direct.
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# -----------------------------------------------------------------------------
+# Black : formatage PEP 8 / longueur 88 / Python 3.10+.
+# -----------------------------------------------------------------------------
 [tool.black]
 line-length = 88
 target-version = ["py310"]
@@ -70,9 +101,34 @@ exclude = '''
   | \.mypy_cache
   | \.tox
   | \.venv
+  | env
+  | venv
   | _build
   | buck-out
   | build
   | dist
+  | data
+  | tests/fixtures
 )/
 '''
+
+# -----------------------------------------------------------------------------
+# Coverage : exclure les fichiers non pertinents.
+# -----------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["api", "scripts", "config"]
+omit = [
+    "tests/*",
+    "ui/*",
+    "scripts/evaluate_rag.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = false

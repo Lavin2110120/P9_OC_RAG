@@ -1,111 +1,75 @@
-"""API FastAPI - Orchestration du pipeline événementiel et FAQ RAG."""
+"""API FastAPI : /health, /ask, /rebuild."""
+import asyncio
 import logging
 import sys
-import asyncio
 from pathlib import Path
 from typing import Any, Dict
+
+# Permet `from api.mistral_qa import ...` quel que soit le cwd.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-# Permet les imports `config.*` et `scripts.*` depuis la racine du projet,
-# quel que soit le répertoire d'exécution.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+from api.mistral_qa import generate_response
 from scripts.fetch_events import main as fetch_events_main
 from scripts.clean_events import main as clean_events_main
 from scripts.vectorize_events import main as vectorize_and_index
 
-# Configuration des logs
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Puls Events API",
-    version="1.0.0",
-    description="API de recommandation d'événements culturels avec RAG Mistral/FAISS.",
-)
+app = FastAPI(title="Puls Events API", version="1.0.0")
 
-# 1. On crée un verrou global pour l'API
 rebuild_lock = asyncio.Lock()
 
-async def run_full_pipeline_safe():
-    """Tâche de fond protégée par un verrou pour la reconstruction."""
-    # Si le verrou est déjà pris, on annule silencieusement
-    if rebuild_lock.locked():
-        logger.warning("⏳ [Pipeline] Une reconstruction est déjà en cours, annulation de la nouvelle demande.")
-        return
 
+async def run_full_pipeline_safe() -> Dict[str, Any]:
+    if rebuild_lock.locked():
+        return {"status": "already_running"}
     async with rebuild_lock:
-        logger.info("🔄 [Pipeline] Début de la reconstruction complète de l'index...")
         try:
-            # Note : Les données sont traitées via le dossier data/processed/
             fetch_events_main()
             clean_events_main()
             vectorize_and_index()
-            logger.info("✅ [Pipeline] Index FAISS reconstruit avec succès !")
+            return {"status": "ok"}
         except Exception as exc:
-            logger.error(f"❌ [Pipeline] Erreur lors de la reconstruction : {exc}", exc_info=True)
+            logger.exception("Échec du rebuild : %s", exc)
+            return {"status": "error", "detail": str(exc)}
 
 
 class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="Question posée au chatbot")
+    query: str = Field(..., min_length=1)
 
-_generate_response = None
 
-def get_generate_response():
-    """Charge le module Mistral/FAISS à la première question.
+@app.get("/health")
+async def health_check() -> Dict[str, Any]:
+    return {"status": "OK", "message": "API opérationnelle"}
 
-    Import différé volontairement pour permettre à l'API de démarrer
-    (et donc à `/rebuild` de fonctionner) même si l'index FAISS n'existe
-    pas encore sur disque.
-    """
-    global _generate_response
-    if _generate_response is None:
-        logger.info("Chargement du module Mistral / FAISS...")
-        from scripts.mistral_qa import generate_response
-        _generate_response = generate_response
-        logger.info("Module Mistral / FAISS initialisé.")
-    return _generate_response
 
-# ==========================================
-# ROUTES DE L'API
-# ==========================================
-
-@app.get("/health", summary="Vérifier l'état de l'API")
-async def health_check():
-    return {"status": "OK", "message": "L'API est opérationnelle."}
-
-@app.post("/ask", summary="Poser une question au chatbot")
+@app.post("/ask")
 async def ask(request: QueryRequest) -> Dict[str, Any]:
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="La requête est vide.")
     try:
-        logger.info(f"Question reçue : {request.query}")
-        if not request.query.strip():
-            raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
-
-        generate_response = get_generate_response()
         response = generate_response(request.query)
-        return {"question": request.query, "response": response}
-
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erreur lors de la génération : {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erreur interne : {str(e)}")
+        logger.exception("Erreur /ask : %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"response": response}
 
-@app.post("/rebuild", summary="Reconstruire l'index FAISS")
-async def rebuild_index(background_tasks: BackgroundTasks):
+
+@app.post("/rebuild")
+async def rebuild(background_tasks: BackgroundTasks) -> Dict[str, Any]:
     if rebuild_lock.locked():
-        raise HTTPException(status_code=429, detail="Une reconstruction est déjà en cours.")
-
+        return {"status": "already_running"}
     background_tasks.add_task(run_full_pipeline_safe)
-    return {
-        "status": "success",
-        "message": "Reconstruction de l'index lancée en tâche de fond."
-    }
+    return {"status": "success", "message": "Pipeline lancé en arrière-plan"}
+
 
 if __name__ == "__main__":
-    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False)

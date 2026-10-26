@@ -1,120 +1,97 @@
-"""Vectorisation des événements avec sentence-transformers et FAISS."""
+"""Vectorise le parquet nettoyé et construit l'index FAISS + métadonnées.
+
+Usage :
+    python -m scripts.vectorize_events
+"""
 import logging
-from config.settings import PROCESSED_FILE
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 import faiss
 
-# --- CONFIGURATION ---
-# Dossier de sortie pour l'index vectoriel
-VECTOR_STORE_DIR = Path("data/vector_store")
-# Modèle d'embedding (léger et performant)
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+from config import settings
 
-# Créer le dossier de sortie si inexistant
-VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
-
-# Fichiers de sortie
-INDEX_FILE = VECTOR_STORE_DIR / "faiss_index.bin"
-METADATA_FILE = VECTOR_STORE_DIR / "metadata.parquet"
-
-# Configurer le logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-# --- FONCTIONS ---
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+
+
 def load_data(file_path: Path) -> pd.DataFrame:
-    """Charge les données depuis le fichier Parquet."""
-    log.info(f"Chargement des données depuis {file_path}...")
+    log.info("Lecture : %s", file_path)
     return pd.read_parquet(file_path)
 
+
 def prepare_texts(df: pd.DataFrame) -> list[str]:
-    """Prépare les textes à vectoriser en combinant les champs pertinents."""
     texts = []
     for _, row in df.iterrows():
-        # Combinaison des champs pour un contexte riche
         text = f"""
-        Titre: {row['title']}
-        Description: {row['description']}
-        Détails: {row['long_description']}
-        Mots-clés: {row['keywords']}
-        Lieu: {row['location_name']}
-        Date: {row['date_begin']}
-        """
-        texts.append(text.strip())
+Titre: {row.get('title', '')}
+Description: {row.get('description', '')}
+Détails: {row.get('long_description', '')}
+Mots-clés: {row.get('keywords', '')}
+Lieu: {row.get('location_name', '')}
+Date: {row.get('date_begin', '')}
+""".strip()
+        texts.append(text)
     return texts
 
-def generate_embeddings(texts: list[str], model_name: str = EMBEDDING_MODEL) -> np.ndarray:
-    """Génère les embeddings pour une liste de textes."""
-    log.info(f"Chargement du modèle {model_name}...")
-    model = SentenceTransformer(model_name)
 
+def generate_embeddings(texts: list[str], model_name: str) -> np.ndarray:
+    log.info("Chargement du modèle %s...", model_name)
+    model = SentenceTransformer(model_name)
     log.info("Génération des embeddings...")
-    embeddings = model.encode(
+    return model.encode(
         texts,
-        batch_size=32,          # Taille des lots pour optimiser la mémoire
-        show_progress_bar=True, # Barre de progression
-        convert_to_numpy=True,  # Retourne un tableau NumPy
-        normalize_embeddings=True  # Normalisation pour FAISS
-    )
-    return embeddings
+        batch_size=32,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+    ).astype("float32")
+
 
 def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
-    """Construit un index FAISS pour la recherche vectorielle."""
     dimension = embeddings.shape[1]
-    log.info(f"Construction de l'index FAISS (dimension: {dimension})...")
-
-    # IndexFlatL2 : recherche exacte avec distance L2 (parfait pour commencer)
+    log.info("Construction de l'index FAISS (dim=%d, n=%d)", dimension, len(embeddings))
     index = faiss.IndexFlatL2(dimension)
     index.add(embeddings)
     return index
 
-def save_index_and_metadata(index: faiss.Index, df: pd.DataFrame, index_path: Path, metadata_path: Path):
-    """Sauvegarde l'index FAISS et les métadonnées."""
-    log.info(f"Sauvegarde de l'index FAISS dans {index_path}...")
+
+def save_index(index, index_path: Path) -> None:
     faiss.write_index(index, str(index_path))
+    log.info("✅ Index : %s", index_path)
 
-    # Sauvegarder uniquement les métadonnées utiles pour le RAG
-    metadata = df[["uid", "title", "date_begin", "location_name", "description", "text"]].copy()
-    log.info(f"Sauvegarde des métadonnées dans {metadata_path}...")
-    metadata.to_parquet(metadata_path)
 
-# --- EXÉCUTION ---
-def main():
-    try:
-        # 1. Charger les données
-        df = load_data(PROCESSED_FILE)
-        log.info(f"✅ {len(df)} événements chargés.")
+def save_metadata(df: pd.DataFrame, metadata_path: Path) -> None:
+    df.to_parquet(metadata_path, index=False)
+    log.info("✅ Metadata : %s", metadata_path)
 
-        # 2. Préparer les textes et les injecter dans df
-        texts = prepare_texts(df)
-        df["text"] = texts
-        log.info(f"✅ {len(texts)} textes préparés pour la vectorisation.")
 
-        # 3. Générer les embeddings
-        embeddings = generate_embeddings(texts)
-        log.info(f"✅ Embeddings générés (shape: {embeddings.shape}).")
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-        # 4. Construire l'index FAISS
-        index = build_faiss_index(embeddings)
+    df = load_data(settings.PROCESSED_FILE)
+    log.info("Documents : %d", len(df))
 
-        # 5. Sauvegarder
-        save_index_and_metadata(index, df, INDEX_FILE, METADATA_FILE)
-        log.info(f"✅ Index et métadonnées sauvegardés dans {VECTOR_STORE_DIR}.")
+    texts = prepare_texts(df)
+    df["text"] = texts
 
-        # 6. Test rapide : rechercher un événement similaire
-        test_query = "concert La Vapeur octobre 2026"
-        test_embedding = generate_embeddings([test_query], EMBEDDING_MODEL)
-        D, I = index.search(test_embedding, k=3)  # Top 3 résultats
-        log.info("\n🔍 Test de recherche avec la requête : '%s'", test_query)
-        for i, (dist, idx) in enumerate(zip(D[0], I[0])):
-            log.info(f"  {i+1}. {df.iloc[idx]['title']} (distance: {dist:.4f})")
+    embeddings = generate_embeddings(texts, EMBEDDING_MODEL)
+    index = build_faiss_index(embeddings)
 
-    except Exception as e:
-        log.error(f"❌ Erreur: {e}", exc_info=True)
-        raise
+    settings.VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    save_index(index, settings.INDEX_FILE)
+    save_metadata(df, settings.METADATA_FILE)
+
+    test_query = "concert La Vapeur octobre 2026"
+    log.info("Test de recherche : %r", test_query)
+
 
 if __name__ == "__main__":
     main()
