@@ -33,11 +33,8 @@ COPY pyproject.toml ./
 # Installation des dépendances core (FastAPI, FAISS, Mistral, …)
 RUN pip install --no-cache-dir ".[core]"
 
-# Pré-téléchargement du modèle d'embedding BAAI/bge-m3 (~2.2 Go) au build
-# pour accélérer le premier démarrage et rendre l'image self-contained.
-# Le nom du modèle est lu depuis l'ARG (par défaut bge-m3) — il suffit de
-# builder avec `--build-arg EMBEDDING_MODEL=...` pour utiliser un autre modèle.
-ARG EMBEDDING_MODEL=BAAI/bge-m3
+
+ARG EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 RUN python -c "from sentence_transformers import SentenceTransformer; \
     SentenceTransformer('${EMBEDDING_MODEL}', cache_folder='${HF_HOME}')" \
     && du -sh ${HF_HOME}

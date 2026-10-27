@@ -49,3 +49,17 @@ tests/
 # Cache et logs supplémentaires
 *.log
 logs/
+
+# Secrets locaux
+.env
+.env.*
+!.env.example
+
+# Données fournies au runtime par montage
+data/
+
+# Artefacts supplémentaires
+.coverage
+htmlcov/
+dist/
+build/
