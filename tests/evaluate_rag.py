@@ -148,19 +148,44 @@ def _load_ragas_components() -> tuple[Any, list[Any], Any, bool]:
         from ragas import evaluate
 
     metrics_module = __import__("ragas.metrics", fromlist=["metrics"])
+
+    # Faithfulness
     faithfulness_cls = getattr(metrics_module, "Faithfulness", None)
     if faithfulness_cls is None:
         faithfulness_cls = getattr(metrics_module, "faithfulness", None)
+
+    # AnswerRelevancy
     relevancy_cls = getattr(metrics_module, "AnswerRelevancy", None)
     if relevancy_cls is None:
         relevancy_cls = getattr(metrics_module, "ResponseRelevancy", None)
     if relevancy_cls is None:
         relevancy_cls = getattr(metrics_module, "answer_relevancy", None)
+
+    # ContextPrecision (NOUVEAU)
+    context_precision_cls = getattr(metrics_module, "ContextPrecision", None)
+    if context_precision_cls is None:
+        context_precision_cls = getattr(metrics_module, "context_precision", None)
+    if context_precision_cls is None:
+        # Essayer l'import depuis ragas.metrics.collections (nouvelle API)
+        try:
+            from ragas.metrics.collections import ContextPrecision as context_precision_cls
+        except ImportError:
+            context_precision_cls = None
+
+    # Vérification des métriques obligatoires
     if faithfulness_cls is None or relevancy_cls is None:
         raise ImportError("RAGAS n'expose pas les métriques Faithfulness et Answer/ResponseRelevancy.")
 
+    # Construction de la liste des métriques
+    metrics_list = [faithfulness_cls(), relevancy_cls()]
+    if context_precision_cls is not None:
+        metrics_list.append(context_precision_cls())
+        logger.info("Métrique ContextPrecision ajoutée")
+    else:
+        logger.warning("ContextPrecision non disponible dans cette version de RAGAS")
+
     modern_dataset = getattr(ragas, "EvaluationDataset", None)
-    return evaluate, [faithfulness_cls(), relevancy_cls()], modern_dataset, modern_dataset is not None
+    return evaluate, metrics_list, modern_dataset, modern_dataset is not None
 
 
 def _make_dataset(rows: list[dict[str, Any]], dataset_cls: Any, modern: bool) -> Any:
@@ -298,19 +323,30 @@ def run_ragas_evaluation() -> None:
         if not isinstance(answer, str):
             raise TypeError("generate_response doit retourner une chaîne.")
 
+        # Construction de la ligne selon la version de RAGAS
         if modern:
-            row = {"user_input": question, "response": answer,
-                   "retrieved_contexts": contexts}
+            row = {
+                "user_input": question,
+                "response": answer,
+                "retrieved_contexts": contexts,
+            }
+            # reference = ground_truth de la réponse
             if item.get("ground_truth") is not None:
                 row["reference"] = item["ground_truth"]
+            # reference_contexts = contextes idéaux pour ContextPrecision
             if item.get("reference_contexts"):
                 row["reference_contexts"] = item["reference_contexts"]
         else:
-            row = {"question": question, "answer": answer, "contexts": contexts}
+            row = {
+                "question": question,
+                "answer": answer,
+                "contexts": contexts,
+            }
             if item.get("ground_truth") is not None:
                 row["ground_truth"] = item["ground_truth"]
             if item.get("reference_contexts"):
                 row["reference_contexts"] = item["reference_contexts"]
+
         rows.append(row)
 
         if idx < len(benchmarks) - 1:
@@ -333,20 +369,38 @@ def run_ragas_evaluation() -> None:
     print("\n===============================")
     print("RÉSULTATS DE L'ÉVALUATION RAGAS")
     print("===============================")
-    
+
     # Définit score_source à partir de results
     score_source = getattr(results, "scores", results)
 
-    # Affiche uniquement les métriques (pas les champs de données)
-    for metric_name in ["faithfulness", "answer_relevancy"]:
+    # Liste complète des métriques à afficher
+    metric_names = ["faithfulness", "answer_relevancy", "context_precision"]
+
+    for metric_name in ["faithfulness", "answer_relevancy", "context_precision"]:
         if metric_name in score_source:
             mean = compute_mean(score_source[metric_name])
             if mean is not None:
                 print(f"{metric_name}: {mean:.3f}")
             else:
                 print(f"{metric_name}: échec/indisponible")
+        else:
+            print(f"{metric_name}: non disponible")
 
     print("===============================")
+
+    # Affichage détaillé par question si disponible
+    if score_rows:
+        print("\n--- DÉTAIL PAR QUESTION ---")
+        for i, row in enumerate(score_rows, 1):
+            print(f"\nQuestion {i}:")
+            for metric_name in metric_names:
+                value = row.get(metric_name, "N/A")
+                if isinstance(value, (int, float)):
+                    print(f"  {metric_name}: {value:.3f}")
+                else:
+                    print(f"  {metric_name}: {value}")
+        print("===============================")
+
     if score_rows:
         logger.info("Résultats enregistrés : %s", RESULTS_FILE)
 
