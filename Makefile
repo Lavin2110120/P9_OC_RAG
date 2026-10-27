@@ -80,7 +80,7 @@ test:
 
 # PS> : python -m scripts.evaluate_rag
 evaluate:
-	python -m scripts.evaluate_rag
+	python -m tests.evaluate_rag
 
 # ---------- Docker ----------
 # PS> : docker build -t puls-events-rag .

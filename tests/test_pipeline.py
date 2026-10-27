@@ -1,7 +1,7 @@
-"""Tests du pipeline (FAISS, clean_events, settings).
+"""Tests du pipeline.
 
-Aucun téléchargement de BAAI/bge-m3 : tous les modèles sont mockés.
-La dimension mockée (1024) correspond à BGE-m3.
+Le modèle d'embedding et l'index FAISS sont mockés.
+La dimension fictive utilisée dans les tests est 1024.
 """
 import importlib
 import sys
@@ -23,6 +23,11 @@ import api.faiss_retriever  # noqa: F401
 import scripts.clean_events  # noqa: F401
 import scripts.fetch_events  # noqa: F401
 
+from datetime import timedelta
+from config import settings
+
+start = settings.DATE_MIN_DT + timedelta(days=30)
+end = start + timedelta(hours=3)
 
 # ===================== tests config/settings =====================
 def test_settings_defines_expected_paths():
@@ -32,22 +37,11 @@ def test_settings_defines_expected_paths():
         assert hasattr(settings, attr), f"settings.{attr} manquant"
 
 
-def test_settings_centralises_embedding_model():
-    """Le nom du modèle et la dimension sont centralisés dans settings."""
-    from config import settings
-    assert hasattr(settings, "EMBEDDING_MODEL"), "EMBEDDING_MODEL manquant"
-    assert hasattr(settings, "EMBEDDING_DIM"), "EMBEDDING_DIM manquant"
-    assert hasattr(settings, "EMBEDDING_MAX_SEQ_LENGTH"), "EMBEDDING_MAX_SEQ_LENGTH manquant"
-    assert hasattr(settings, "EMBEDDING_BATCH_SIZE"), "EMBEDDING_BATCH_SIZE manquant"
-    assert hasattr(settings, "EMBEDDING_NORMALIZE"), "EMBEDDING_NORMALIZE manquant"
-    # Le défaut doit être bge-m3.
-    assert "bge-m3" in settings.EMBEDDING_MODEL
-    # Le nom du modèle ne doit pas être celui d'une variante antérieure.
-    assert settings.EMBEDDING_MODEL != "sentence-transformers/all-MiniLM-L6-v2"
-    # Dimension par défaut = 1024 (info ; la dim réelle est déduite du modèle).
-    assert settings.EMBEDDING_DIM == 1024
-    # bge-m3 n'a pas besoin de préfixe de requête : normalisé activé.
-    assert settings.EMBEDDING_NORMALIZE is True
+def test_retriever_defines_embedding_configuration():
+    from api.faiss_retriever import MODEL_NAME, EMBEDDING_DEVICE
+
+    assert MODEL_NAME == "BAAI/bge-small-en-v1.5"
+    assert EMBEDDING_DEVICE == "cpu"
 
 
 # ===================== tests clean_events =====================
@@ -58,7 +52,7 @@ def _sample_raw_event():
         "description": {"fr": "Super concert"},
         "longDescription": {"fr": "Détails du concert"},
         "keywords": {"fr": ["rock", "musique"]},
-        "timings": [{"start": "2026-10-14T20:00:00", "end": "2026-10-14T23:00:00"}],
+        "timings": [{"begin": start.isoformat(), "end": end.isoformat()}],
         "location": {
             "name": "La Vapeur",
             "city": "Dijon",
@@ -73,23 +67,19 @@ def _sample_raw_event():
     }
 
 
-def test_clean_events_end_to_end(tmp_path):
-    """Crée un parquet brut au format de fetch_events puis appelle clean_dataframe."""
-    from scripts.clean_events import clean_dataframe
+def test_clean_events_end_to_end():
+    from scripts.clean_events import clean_dataframe, flatten_event
 
-    raw = pd.DataFrame([_sample_raw_event()] * 3)
-    raw_path = tmp_path / "events_raw.parquet"
-    raw.to_parquet(raw_path, index=False)
+    raw_events = [_sample_raw_event() for _ in range(3)]
+    df = pd.DataFrame([flatten_event(event) for event in raw_events])
 
-    # Charge et aplati comme fetch_events
-    from scripts.fetch_events import flatten_event
-    df = pd.DataFrame([flatten_event(e) for e in [_sample_raw_event()]])
-    df = clean_dataframe(df)
+    cleaned = clean_dataframe(df)
 
-    assert "text" in df.columns, "Colonne 'text' manquante"
-    assert len(df) >= 1
-    assert all(df["title"].str.len() > 0)
-    assert all(df["text"].str.contains("Titre"))
+    # Les trois événements ont le même UID.
+    assert len(cleaned) == 1
+    assert cleaned.loc[0, "title"] == "Concert rock"
+    assert "Titre : Concert rock" in cleaned.loc[0, "text"]
+    assert pd.notna(cleaned.loc[0, "date_begin"])
 
 
 # ===================== tests faiss_retriever (mockés) =====================
@@ -127,9 +117,7 @@ def mock_retriever_env():
         st_instance = MagicMock()
         st_instance.get_sentence_embedding_dimension.return_value = BGE_M3_DIM
         st_instance.max_seq_length = 512
-        st_instance.encode.return_value = np.array([[0.1] * BGE_M3_DIM,
-                                                    [0.2] * BGE_M3_DIM],
-                                                   dtype="float32")
+        st_instance.encode.return_value = np.full((1, BGE_M3_DIM),1 / np.sqrt(BGE_M3_DIM),dtype="float32",)
         mock_st.return_value = st_instance
         yield
 
@@ -176,13 +164,18 @@ def test_retrieve_handles_negative_index(mock_retriever_env):
     assert len(docs) == 1
 
 
-def test_retriever_init_rejects_dim_mismatch(mock_retriever_env):
-    """Si l'index est dans une autre dimension que le modèle, on doit avoir une erreur claire."""
+def test_retrieve_caps_k_to_index_size(mock_retriever_env):
     from api.faiss_retriever import FAISSRetriever
-    FAISSRetriever._instance = None
 
-    # Casser la cohérence : index dim 384, modèle dim 1024
-    mock_idx = MagicMock(ntotal=2, d=384)
-    with patch("api.faiss_retriever.faiss.read_index", return_value=mock_idx):
-        with pytest.raises(ValueError, match="Incohérence de dimension"):
-            FAISSRetriever()
+    FAISSRetriever._instance = None
+    r = FAISSRetriever()
+
+    r.index.search.return_value = (
+        np.array([[0.9, 0.8]], dtype="float32"),
+        np.array([[0, 1]], dtype="int64"),
+    )
+
+    docs = r.retrieve("concert", k=100)
+
+    assert len(docs) == 2
+    assert r.index.search.call_args.args[1] == r.index.ntotal

@@ -226,7 +226,7 @@ def main() -> None:
     RAW_PATH.parent.mkdir(parents=True, exist_ok=True)
     safe_events = clean_unicode(all_events)
     RAW_PATH.write_text(
-        json.dumps(safe_events, ensure_ascii=False),
+        json.dumps(safe_events, ensure_ascii=True),
         encoding="utf-8",
     )
 

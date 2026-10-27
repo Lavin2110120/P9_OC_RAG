@@ -1,26 +1,72 @@
-"""Évaluation RAGAS du pipeline (nécessite MISTRAL_API_KEY + annotated_qa.json)."""
+"""Évalue le pipeline RAG avec RAGAS (à placer dans ``tests/``).
+
+Exécution depuis la racine du dépôt : ``python tests/evaluate_rag.py``.
+L'évaluation réelle appelle le modèle Mistral configuré dans ``api.mistral_qa``.
+"""
 from __future__ import annotations
 
+import csv
+import inspect
 import json
 import logging
+import math
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from dotenv import load_dotenv
+# === CONFIGURATION SSL (AVANT tous les imports qui utilisent HTTPS) ===
+import certifi
+os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
+# Configuration globale de httpx pour utiliser les certificats système
+import ssl
+import httpx
+
+# Créer un contexte SSL qui utilise les certificats système + certifi
+_ssl_context = ssl.create_default_context()
+_ssl_context.load_verify_locations(certifi.where())
+
+# Monkey-patch httpx pour utiliser ce contexte par défaut
+_original_client_init = httpx.Client.__init__
+_original_async_client_init = httpx.AsyncClient.__init__
+
+def _patched_client_init(self, *args, **kwargs):
+    kwargs.setdefault("verify", _ssl_context)
+    _original_client_init(self, *args, **kwargs)
+
+def _patched_async_client_init(self, *args, **kwargs):
+    kwargs.setdefault("verify", _ssl_context)
+    _original_async_client_init(self, *args, **kwargs)
+
+httpx.Client.__init__ = _patched_client_init
+httpx.AsyncClient.__init__ = _patched_async_client_init
+
+# Alternative avec truststore si disponible
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
+import ragas
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_huggingface import HuggingFaceEmbeddings
+
+
+# === CHOIX DU LLM POUR L'ÉVALUATION ===
+# Option 1: Mistral (si quota disponible) - décommente si besoin
+# from langchain_mistralai import ChatMistralAI
+
+# Option 2: Ollama (local, gratuit, pas de rate limit) - RECOMMANDÉ
+from langchain_ollama import ChatOllama
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-load_dotenv()
-
-try:
-    from config.settings import MISTRAL_API_KEY
-except ImportError:
-    MISTRAL_API_KEY = None
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -29,50 +75,203 @@ logger = logging.getLogger(__name__)
 BENCHMARKS_FILE = ROOT / "annotated_qa.json"
 RESULTS_FILE = ROOT / "ragas_evaluation_results.csv"
 
-EVALUATION_LIMIT = 3
-RETRIEVAL_K = 15
-MIN_FAITHFULNESS = 0.50
-MIN_ANSWER_RELEVANCY = 0.40
+EVALUATION_LIMIT = 3  # On peut remettre 3 avec Ollama
+RETRIEVAL_K = 5
+
+# Délai entre les appels (moins critique avec Ollama)
+RATE_LIMIT_DELAY = 0.5
+
+from config.settings import MISTRAL_API_KEY
+
+
+def create_evaluation_llm():
+    """
+    Crée le LLM pour l'évaluation RAGAS.
+    Utilise Ollama (local) par défaut pour éviter les rate limits.
+    """
+    # === OPTION 1: Ollama (recommandé, gratuit, local) ===
+    logger.info("Utilisation d'Ollama (modèle local) pour l'évaluation RAGAS")
+    return ChatOllama(
+        model="mistral",  # ou "llama3.2", "phi3", etc. selon ce qui est installé
+        temperature=0,
+        # num_ctx=4096,  # Augmente le contexte si besoin
+    )
+
+    # === OPTION 2: Mistral (décommente si tu as du quota) ===
+    # logger.info("Utilisation de Mistral pour l'évaluation RAGAS")
+    # return ChatMistralAI(
+    #     api_key=MISTRAL_API_KEY,
+    #     model="mistral-small-latest",
+    #     temperature=0,
+    #     max_retries=5,
+    #     timeout=120,
+    # )
 
 
 def load_benchmarks(path: Path) -> list[dict[str, Any]]:
+    """Charge au plus EVALUATION_LIMIT questions annotées."""
     with path.open("r", encoding="utf-8") as f:
         benchmarks = json.load(f)
     if not isinstance(benchmarks, list):
-        return []
+        raise ValueError(f"Le benchmark doit être une liste JSON : {path}")
+    if any(not isinstance(item, dict) for item in benchmarks):
+        raise ValueError("Chaque entrée du benchmark doit être un objet JSON.")
     return benchmarks[:EVALUATION_LIMIT]
 
 
-def compute_mean(values: Any) -> float:
+def compute_mean(values: Any) -> float | None:
+    """Moyenne des scores numériques observés; None s'il n'y en a aucun."""
     if isinstance(values, (int, float)):
-        return float(values)
-    if values is None:
-        return 0.0
-    valid = []
-    for v in values:
+        number = float(values)
+        return number if math.isfinite(number) else None
+    if values is None or isinstance(values, (str, bytes, dict)):
+        return None
+    try:
+        iterator: Iterable[Any] = iter(values)
+    except TypeError:
+        return None
+    valid: list[float] = []
+    for value in iterator:
         try:
-            n = float(v)
+            number = float(value)
         except (TypeError, ValueError):
             continue
-        if n == n:
-            valid.append(n)
-    return sum(valid) / len(valid) if valid else 0.0
+        if math.isfinite(number):
+            valid.append(number)
+    return sum(valid) / len(valid) if valid else None
+
+
+def _load_ragas_components() -> tuple[Any, list[Any], Any, bool]:
+    """Importe evaluate, métriques et format de dataset selon la version RAGAS."""
+    evaluate = getattr(ragas, "evaluate", None)
+    if evaluate is None:
+        from ragas import evaluate
+
+    metrics_module = __import__("ragas.metrics", fromlist=["metrics"])
+    faithfulness_cls = getattr(metrics_module, "Faithfulness", None)
+    if faithfulness_cls is None:
+        faithfulness_cls = getattr(metrics_module, "faithfulness", None)
+    relevancy_cls = getattr(metrics_module, "AnswerRelevancy", None)
+    if relevancy_cls is None:
+        relevancy_cls = getattr(metrics_module, "ResponseRelevancy", None)
+    if relevancy_cls is None:
+        relevancy_cls = getattr(metrics_module, "answer_relevancy", None)
+    if faithfulness_cls is None or relevancy_cls is None:
+        raise ImportError("RAGAS n'expose pas les métriques Faithfulness et Answer/ResponseRelevancy.")
+
+    modern_dataset = getattr(ragas, "EvaluationDataset", None)
+    return evaluate, [faithfulness_cls(), relevancy_cls()], modern_dataset, modern_dataset is not None
+
+
+def _make_dataset(rows: list[dict[str, Any]], dataset_cls: Any, modern: bool) -> Any:
+    """Prépare le schéma RAGAS v0.1 (datasets) ou le schéma single-turn récent."""
+    if modern:
+        if hasattr(dataset_cls, "from_list"):
+            return dataset_cls.from_list(rows)
+        sample_cls = getattr(__import__("ragas"), "SingleTurnSample", None)
+        if sample_cls is None:
+            raise ImportError("La version RAGAS détectée n'expose pas SingleTurnSample.")
+        return dataset_cls(samples=[sample_cls(**row) for row in rows])
+
+    try:
+        from datasets import Dataset
+    except ImportError as exc:
+        raise ImportError("Le format RAGAS historique nécessite le paquet 'datasets'.") from exc
+    return Dataset.from_list(rows)
+
+
+def _run_config_kwargs(evaluate: Any) -> dict[str, Any]:
+    """N'ajoute RunConfig que si la signature installée le prend en charge."""
+    try:
+        signature = inspect.signature(evaluate)
+    except (TypeError, ValueError):
+        return {}
+    parameters = signature.parameters
+    accepts_extra = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    if "run_config" not in parameters and not accepts_extra:
+        return {}
+    try:
+        import ragas
+        run_config_cls = getattr(ragas, "RunConfig", None)
+        if run_config_cls is None:
+            from ragas.run_config import RunConfig as run_config_cls
+        config_params = inspect.signature(run_config_cls).parameters
+        kwargs: dict[str, Any] = {}
+        if "max_workers" in config_params:
+            kwargs["max_workers"] = 1  # 1 seul worker pour la stabilité
+        if "timeout" in config_params:
+            kwargs["timeout"] = 600  # 10 minutes pour Ollama (plus lent)
+        if "max_retries" in config_params:
+            kwargs["max_retries"] = 3
+        if "max_wait" in config_params:
+            kwargs["max_wait"] = 60
+        return {"run_config": run_config_cls(**kwargs)}
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return {}
+
+
+def _score_rows(results: Any) -> list[dict[str, Any]]:
+    """Normalise les retours EvaluationResult usuels sans inventer de score."""
+    to_pandas = getattr(results, "to_pandas", None)
+    if callable(to_pandas):
+        frame = to_pandas()
+        return frame.to_dict(orient="records")
+
+    scores = getattr(results, "scores", results)
+    if isinstance(scores, dict):
+        lengths = [len(value) for value in scores.values()
+                   if isinstance(value, (list, tuple))]
+        row_count = max(lengths, default=1)
+        rows: list[dict[str, Any]] = []
+        for index in range(row_count):
+            row: dict[str, Any] = {}
+            for name, values in scores.items():
+                row[name] = values[index] if isinstance(values, (list, tuple)) and index < len(values) else (
+                    values if not isinstance(values, (list, tuple)) else None
+                )
+            rows.append(row)
+        return rows
+    if isinstance(scores, (list, tuple)):
+        return [dict(row) if isinstance(row, dict) else {"score": row} for row in scores]
+    return []
+
+
+def _save_results(rows: list[dict[str, Any]], path: Path) -> None:
+    """Enregistre les scores réellement renvoyés par RAGAS au format CSV."""
+    if not rows:
+        logger.warning("RAGAS n'a fourni aucune ligne de score; aucun CSV écrit.")
+        return
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def run_ragas_evaluation() -> None:
-    """Lance l'évaluation RAGAS — nécessite MISTRAL_API_KEY + deps ragas/instructor."""
+    """Évalue les questions réelles sans faire d'appels si les prérequis manquent."""
+    # LLM pour l'évaluation (Ollama local)
+    evaluation_llm = LangchainLLMWrapper(create_evaluation_llm())
+
+    # Embeddings pour l'évaluation (local aussi)
+    evaluation_embeddings = LangchainEmbeddingsWrapper(
+        HuggingFaceEmbeddings(
+            model_name="BAAI/bge-small-en-v1.5",
+            model_kwargs={"device": "cpu"},
+        )
+    )
+
     try:
-        from ragas import RunConfig, evaluate, SingleTurnSample
-        from ragas.metrics import Faithfulness, AnswerRelevancy
-    except ImportError as e:
-        logger.error("ragas non installé : %s", e)
+        evaluate, metrics, dataset_cls, modern = _load_ragas_components()
+    except ImportError as exc:
+        logger.error("RAGAS ou ses métriques ne sont pas disponibles : %s", exc)
         return
 
     try:
         from api.faiss_retriever import FAISSRetriever
         from api.mistral_qa import generate_response
-    except Exception as e:
-        logger.error("Modules RAG indisponibles : %s", e)
+    except Exception as exc:
+        logger.error("Modules RAG indisponibles : %s", exc)
         return
 
     if not BENCHMARKS_FILE.exists():
@@ -82,40 +281,74 @@ def run_ragas_evaluation() -> None:
     benchmarks = load_benchmarks(BENCHMARKS_FILE)
     if not benchmarks:
         raise ValueError("Benchmark vide.")
+    if any(not isinstance(item.get("question"), str) or not item["question"].strip()
+           for item in benchmarks):
+        raise ValueError("Chaque entrée du benchmark doit avoir un champ 'question' non vide.")
 
     logger.info("Évaluation de %d questions...", len(benchmarks))
-
     retriever = FAISSRetriever.get_instance()
-    samples = []
-    for item in benchmarks:
+    rows: list[dict[str, Any]] = []
+    for idx, item in enumerate(benchmarks):
         question = item["question"]
+        logger.info("Question %d/%d : %s", idx + 1, len(benchmarks), question[:80])
+
         docs = retriever.retrieve(question, k=RETRIEVAL_K)
-        contexts = [d.page_content for d in docs]
+        contexts = [doc.page_content for doc in docs]
         answer = generate_response(question, k=RETRIEVAL_K)
-        sample_data = {
-            "user_input": question,
-            "response": answer,
-            "retrieved_contexts": contexts,
-        }
-        if item.get("ground_truth") is not None:
-            sample_data["reference"] = item["ground_truth"]
-        if item.get("reference_contexts"):
-            sample_data["reference_contexts"] = item["reference_contexts"]
-        samples.append(SingleTurnSample(**sample_data))
-        time.sleep(0.5)
+        if not isinstance(answer, str):
+            raise TypeError("generate_response doit retourner une chaîne.")
 
-    run_config = RunConfig(max_workers=1, timeout=120)
-    metrics = [Faithfulness(), AnswerRelevancy()]
-    results = evaluate(dataset=samples, metrics=metrics, run_config=run_config)
+        if modern:
+            row = {"user_input": question, "response": answer,
+                   "retrieved_contexts": contexts}
+            if item.get("ground_truth") is not None:
+                row["reference"] = item["ground_truth"]
+            if item.get("reference_contexts"):
+                row["reference_contexts"] = item["reference_contexts"]
+        else:
+            row = {"question": question, "answer": answer, "contexts": contexts}
+            if item.get("ground_truth") is not None:
+                row["ground_truth"] = item["ground_truth"]
+            if item.get("reference_contexts"):
+                row["reference_contexts"] = item["reference_contexts"]
+        rows.append(row)
 
-    output_path = RESULTS_FILE
-    logger.info("Résultats : %s", results.scores)
+        if idx < len(benchmarks) - 1:
+            time.sleep(RATE_LIMIT_DELAY)
+
+    dataset = _make_dataset(rows, dataset_cls, modern)
+
+    logger.info("Lancement de l'évaluation RAGAS avec Ollama (peut prendre 5-15 minutes)...")
+    results = evaluate(
+        dataset=dataset,
+        metrics=metrics,
+        llm=evaluation_llm,
+        embeddings=evaluation_embeddings,
+        raise_exceptions=False,
+        **_run_config_kwargs(evaluate),
+    )
+    score_rows = _score_rows(results)
+    _save_results(score_rows, RESULTS_FILE)
+
     print("\n===============================")
-    print("🏆 RÉSULTATS DE L'ÉVALUATION RAGAS")
+    print("RÉSULTATS DE L'ÉVALUATION RAGAS")
     print("===============================")
-    for name, values in results.scores.items():
-        print(f"{name}: {compute_mean(values):.3f}")
+    
+    # Définit score_source à partir de results
+    score_source = getattr(results, "scores", results)
+
+    # Affiche uniquement les métriques (pas les champs de données)
+    for metric_name in ["faithfulness", "answer_relevancy"]:
+        if metric_name in score_source:
+            mean = compute_mean(score_source[metric_name])
+            if mean is not None:
+                print(f"{metric_name}: {mean:.3f}")
+            else:
+                print(f"{metric_name}: échec/indisponible")
+
     print("===============================")
+    if score_rows:
+        logger.info("Résultats enregistrés : %s", RESULTS_FILE)
 
 
 if __name__ == "__main__":
