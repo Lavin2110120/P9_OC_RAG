@@ -38,9 +38,9 @@ Makefile
 *.log
 
 # Fichiers de documentation et de présentation
-README.md
 docs/
 *.md
+!README.md
 *.pptx
 
 # Tests

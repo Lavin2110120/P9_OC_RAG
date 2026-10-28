@@ -6,8 +6,6 @@ ENV/
 
 # Fichiers de configuration sensible
 .env
-Dockerfile
-Makefile
 annotated_qa.json
 
 # Python

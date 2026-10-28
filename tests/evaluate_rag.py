@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 BENCHMARKS_FILE = ROOT / "annotated_qa.json"
 RESULTS_FILE = ROOT / "ragas_evaluation_results.csv"
 
-EVALUATION_LIMIT = 3  # On peut remettre 3 avec Ollama
+EVALUATION_LIMIT = 42
 RETRIEVAL_K = 5
 
 # Délai entre les appels (moins critique avec Ollama)

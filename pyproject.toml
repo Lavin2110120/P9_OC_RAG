@@ -37,6 +37,8 @@ core = [
     "sentence-transformers>=2.2.0",
     "langchain-core>=0.2.0",
     "langchain-mistralai>=0.1.0",
+    "truststore>=0.9.1",
+    "requests>=2.31.0",
 ]
 # Outillage de dev + évaluation RAGAS + tests.
 dev = [

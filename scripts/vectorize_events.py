@@ -29,17 +29,31 @@ def load_data(file_path: Path) -> pd.DataFrame:
 
 
 def prepare_texts(df: pd.DataFrame) -> list[str]:
-    texts = []
-    for _, row in df.iterrows():
-        text = f"""
-Titre: {row.get('title', '')}
-Description: {row.get('description', '')}
-Détails: {row.get('long_description', '')}
-Mots-clés: {row.get('keywords', '')}
-Lieu: {row.get('location_name', '')}
-Date: {row.get('date_begin', '')}
-""".strip()
-        texts.append(text)
+    """Réutilise le texte construit par clean_events.py."""
+    if "text" not in df.columns:
+        raise ValueError(
+            "La colonne 'text' est absente du parquet nettoyé. "
+            "Relancez : python -m scripts.clean_events"
+        )
+
+    texts = df["text"].fillna("").astype(str).tolist()
+
+    if not texts:
+        raise ValueError(
+            "Le parquet nettoyé ne contient aucun événement."
+        )
+
+    empty_positions = [
+        position
+        for position, text in enumerate(texts)
+        if not text.strip()
+    ]
+    if empty_positions:
+        raise ValueError(
+            f"{len(empty_positions)} événement(s) ont un texte vide. "
+            "Vérifiez le nettoyage avant de créer l'index."
+        )
+
     return texts
 
 
@@ -80,9 +94,14 @@ def main() -> None:
     log.info("Documents : %d", len(df))
 
     texts = prepare_texts(df)
-    df["text"] = texts
 
     embeddings = generate_embeddings(texts, EMBEDDING_MODEL)
+
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(df):
+        raise ValueError(
+            "Le nombre d'embeddings ne correspond pas "
+            "au nombre de lignes de métadonnées."
+        )
     index = build_faiss_index(embeddings)
 
     settings.VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
