@@ -44,10 +44,12 @@ AGENDA_SEARCH = "Dijon"
 # Cahier des charges : "zone = Dijon + 20 km".
 RADIUS_KM = float(os.getenv("RADIUS_KM", "20"))
 
-# --- Période : 1 an d'historique + 1 an à venir.
-# IMPORTANT : on fige la date de référence pour rendre le filtre reproductible
-# (sinon DATE_MIN/DATE_MAX bougent à chaque exécution). Override possible via
-# la variable d'env REFERENCE_DATE au format ISO (YYYY-MM-DD).
+# --- Fenêtre historique / compatibilité de configuration.
+# DATE_MAX reste définie pour les consommateurs existants, mais la collecte et
+# le nettoyage n'en font plus une borne haute afin de conserver les événements
+# au-delà d'un an dans le futur.
+# La date de référence suit aujourd'hui par défaut; REFERENCE_DATE permet
+# de la fixer pour reproduire un run (format ISO YYYY-MM-DD).
 _ref_env = os.getenv("REFERENCE_DATE")
 if _ref_env:
     try:

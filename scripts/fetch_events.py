@@ -96,39 +96,60 @@ def _get(url: str, params: dict | None = None) -> dict:
     raise RuntimeError(f"Échec de la requête : {url}")
 
 
+def _after_params(after) -> dict:
+    """Encode un curseur OpenAgenda en paramètres répétés documentés ``after[]``.
+
+    Les valeurs nulles ne sont pas documentées comme composantes de curseur;
+    les refuser évite d'inventer une représentation réseau non spécifiée.
+    """
+    if after is None or after == []:
+        return {}
+    values = list(after) if isinstance(after, (list, tuple)) else [after]
+    if any(value is None for value in values):
+        raise ValueError("Composante de curseur OpenAgenda nulle non documentée")
+    return {"after[]": values}
+
+
 def search_agendas(query: str) -> list[dict]:
     """Recherche tous les agendas correspondant à une requête."""
     agendas = []
     after = None
+    seen_cursors = set()
 
     while True:
-        params = {"search": query, "size": 50}
-        if after:
-            params["after"] = after
+        # OpenAgenda documente une taille maximale de 100 pour les agendas.
+        params = {"search": query, "size": 100}
+        params.update(_after_params(after))
 
         data = _get(f"{BASE_URL}/agendas", params)
         batch = data.get("agendas", [])
         agendas.extend(batch)
 
-        after = data.get("after")
-        if not after or not batch:
+        next_after = data.get("after")
+        if not next_after or not batch:
             break
+        cursor_key = tuple(next_after) if isinstance(next_after, (list, tuple)) else (next_after,)
+        if cursor_key in seen_cursors:
+            raise RuntimeError(f"Curseur de pagination agendas répété : {next_after!r}")
+        seen_cursors.add(cursor_key)
+        after = next_after
 
     return agendas
 
 
 def select_agendas(agendas: list[dict]) -> list[dict]:
-    """Garde les agendas correspondant à la liste blanche, sans doublons."""
-    whitelist = [normalize(item) for item in settings.AGENDA_WHITELIST]
+    """Dédoublonne sans re-filtrer par titre les agendas trouvés par recherche.
+
+    La recherche API (Dijon, Côte-d'Or, Bourgogne) est déjà un filtre de
+    découverte. L'ancienne liste blanche de titres excluait des agendas
+    pertinents dont le titre n'énumérait pas ces mots; la zone réelle est
+    contrôlée ensuite sur chaque événement.
+    """
     selected = {}
-
     for agenda in agendas:
-        title = normalize(agenda.get("title"))
         uid = agenda.get("uid")
-
-        if uid is not None and any(word in title for word in whitelist):
+        if uid is not None:
             selected[uid] = agenda
-
     return list(selected.values())
 
 
@@ -136,24 +157,35 @@ def fetch_agenda_events(agenda_uid: int) -> list[dict]:
     """Récupère les événements d'un agenda dans la période configurée."""
     events = []
     after = None
+    seen_cursors = set()
 
     while True:
         params = {
-            "size": settings.PAGE_SIZE,
+            # Maximum documenté pour cette route OpenAgenda v2 : 300.
+            "size": min(max(int(settings.PAGE_SIZE), 1), 300),
+            # Pas de borne supérieure : les événements au-delà de DATE_MAX_DT
+            # restent récupérables. DATE_MIN conserve l'historique et les
+            # événements en cours; la sélection réelle reste géographique.
             "timings[gte]": _to_api_param(settings.DATE_MIN_DT),
-            "timings[lte]": _to_api_param(settings.DATE_MAX_DT),
             "detailed": 1,
         }
-        if after:
-            params["after"] = after
+        # after est un curseur multi-valeurs renvoyé par l'API v2.
+        params.update(_after_params(after))
 
         data = _get(f"{BASE_URL}/agendas/{agenda_uid}/events", params)
         batch = data.get("events", [])
         events.extend(batch)
 
-        after = data.get("after")
-        if not batch or not after:
+        next_after = data.get("after")
+        if not batch or not next_after:
             break
+        cursor_key = tuple(next_after) if isinstance(next_after, (list, tuple)) else (next_after,)
+        if cursor_key in seen_cursors:
+            raise RuntimeError(
+                f"Curseur de pagination événements répété pour agenda {agenda_uid}: {next_after!r}"
+            )
+        seen_cursors.add(cursor_key)
+        after = next_after
 
     return events
 
@@ -177,9 +209,8 @@ def main() -> None:
         )
 
     log.info(
-        "Fenêtre API : %s → %s (référence TODAY=%s)",
+        "Fenêtre API : %s → sans borne supérieure (référence TODAY=%s)",
         settings.DATE_MIN_DT.isoformat(),
-        settings.DATE_MAX_DT.isoformat(),
         settings.TODAY,
     )
 
@@ -193,7 +224,7 @@ def main() -> None:
     log.info("%d agendas candidats", len(candidates))
 
     agendas = select_agendas(list(candidates.values()))
-    log.info("%d agendas retenus (liste blanche)", len(agendas))
+    log.info("%d agendas retenus après dédoublonnage", len(agendas))
 
     all_events = []
     seen = set()
@@ -202,8 +233,10 @@ def main() -> None:
         try:
             events = fetch_agenda_events(agenda["uid"])
         except RuntimeError as exc:
-            log.error("Agenda %s ignoré : %s", agenda.get("uid"), exc)
-            continue
+            # Ne pas écrire un jeu de données partiel comme s'il était complet.
+            raise RuntimeError(
+                f"Collecte incomplète : échec de l'agenda {agenda.get('uid')}"
+            ) from exc
 
         kept = 0
         for event in events:

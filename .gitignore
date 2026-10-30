@@ -20,6 +20,8 @@ src/
 data/
 ragas_evaluation_results.csv
 *.egg-info/
+*.zip
+build/
 
 # Documents/rapports
 scripts/files_opener.ipynb

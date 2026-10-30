@@ -47,6 +47,7 @@ CATEGORY_KEYWORDS = {
     "festival": ["festival"],
     "vivre_ensemble": ["jeune public", "seniors", "dijon"],
 }
+# Filtre éditorial/culturel existant, conservé : ce n'est pas une borne de dates.
 EXCLUDED_CATEGORIES: list[str] = ["sante_bien_etre", "vivre_ensemble"]
 
 # Ordre de priorité : la 1re catégorie qui matche l'emporte.
@@ -89,14 +90,46 @@ _BEGIN_CANDIDATES = ("begin", "start", "from", "dateStart", "date_start")
 _END_CANDIDATES = ("end", "finish", "to", "dateEnd", "date_end")
 
 
-def _extract_from_timings(timings):
-    """Renvoie (date_begin, date_end) depuis un tableau ``timings`` Open Agenda."""
-    if not timings:
+def _extract_from_timings(timings, date_min=None, future_after=None):
+    """Renvoie les bornes utiles d'un événement à occurrences multiples.
+
+    Si les premiers créneaux sont échus mais que l'événement possède encore
+    des créneaux dans la période collectée, le début aplati devient le premier
+    créneau non échu. La forme du dictionnaire retourné par ``flatten_event``
+    reste inchangée.
+    """
+    valid = [slot for slot in (timings or []) if isinstance(slot, dict)]
+    if not valid:
         return None, None
-    first, last = timings[0], timings[-1]
-    if not isinstance(first, dict) or not isinstance(last, dict):
-        return None, None
-    return first.get("begin"), last.get("end")
+
+    def stamp(value):
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        return parsed if not pd.isna(parsed) else None
+
+    lower_bound = stamp(date_min) if date_min is not None else None
+    future_cutoff = stamp(future_after) if future_after is not None else None
+    ordered = sorted(
+        enumerate(valid),
+        key=lambda pair: stamp(pair[1].get("begin")) or pd.Timestamp.max.tz_localize("UTC"),
+    )
+    future_slots, in_history_window = [], []
+    for _, slot in ordered:
+        begin, end = stamp(slot.get("begin")), stamp(slot.get("end"))
+        if future_cutoff is not None and end is not None and end >= future_cutoff:
+            future_slots.append(slot)
+        if lower_bound is None or (end is not None and end >= lower_bound):
+            in_history_window.append(slot)
+    # Priorité à la prochaine occurrence active/future; s'il n'y en a pas,
+    # garder la première occurrence de la fenêtre historique conservée.
+    first = (future_slots or in_history_window or [ordered[0][1]])[0]
+    ends = [slot.get("end") for slot in valid if slot.get("end") not in (None, "")]
+    if ends:
+        parsed_ends = [(stamp(value), value) for value in ends]
+        valid_ends = [(when, value) for when, value in parsed_ends if when is not None]
+        last_end = max(valid_ends, key=lambda item: item[0])[1] if valid_ends else ends[-1]
+    else:
+        last_end = None
+    return first.get("begin"), last_end
 
 
 def _extract_from_dict_keys(obj, candidates):
@@ -119,7 +152,14 @@ def _extract_dates(e: dict):
       3. ``date_start`` / ``date_end``
     """
     timings = e.get("timings") or []
-    b, en = _extract_from_timings(timings)
+    reference_day = getattr(settings, "TODAY", None)
+    future_after = (
+        datetime.combine(reference_day, datetime.min.time(), tzinfo=timezone.utc)
+        if reference_day is not None else None
+    )
+    b, en = _extract_from_timings(
+        timings, getattr(settings, "DATE_MIN_DT", None), future_after
+    )
     if b is not None or en is not None:
         return b, en
 
@@ -239,17 +279,18 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     n1 = len(df)
     log.info("[1/8] Dédoublonnage : %d → %d", n0, n1)
 
-    # 2. Champs obligatoires : un titre et au moins une description
+    # 2. Qualité minimale : un titre suffit; descriptions peuvent manquer
+    # sur les fiches OpenAgenda, et ne doivent pas supprimer un événement valide.
     for col in ["title", "description", "long_description"]:
         df[col] = df[col].fillna("")
-    df = df[df["title"].str.len() > 0]
-    df = df[(df["description"].str.len() > 0) | (df["long_description"].str.len() > 0)].copy()
+    df = df[df["title"].str.len() > 0].copy()
     n2 = len(df)
     log.info("[2/8] Champs obligatoires : %d → %d", n1, n2)
 
     # ---- DIAGNOSTIC période (AVANT le filtre) ----
     log.info(
-        "[3/8] Fenêtre utilisée : DATE_MIN=%s → DATE_MAX=%s (référence TODAY=%s)",
+        "[3/8] Fenêtre utilisée : DATE_MIN=%s → sans borne supérieure "
+        "(DATE_MAX configurée=%s, référence TODAY=%s)",
         getattr(settings, "DATE_MIN_DT", settings.DATE_MIN),
         getattr(settings, "DATE_MAX_DT", settings.DATE_MAX),
         settings.TODAY,
@@ -264,24 +305,22 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["date_begin"])
     log.info("[3/8] Après dropna(date_begin) : %d → %d", n_before_dropna, len(df))
 
-    # Bornes en UTC, comparables aux séries tz-aware
-    if hasattr(settings, "DATE_MIN_DT") and hasattr(settings, "DATE_MAX_DT"):
+    # Borne basse UTC uniquement. DATE_MAX reste exposée dans settings pour
+    # compatibilité, mais ne doit plus exclure les événements futurs lointains.
+    if hasattr(settings, "DATE_MIN_DT"):
         date_min = pd.Timestamp(settings.DATE_MIN_DT)
-        date_max = pd.Timestamp(settings.DATE_MAX_DT)
     else:
         date_min = pd.Timestamp(settings.DATE_MIN, tz="UTC")
-        date_max = pd.Timestamp(settings.DATE_MAX, tz="UTC")
 
-    # Un événement est gardé s'il chevauche la fenêtre [DATE_MIN, DATE_MAX] :
-    #   date_end >= DATE_MIN  ET  date_begin <= DATE_MAX
+    # Garde tout événement encore en cours à DATE_MIN ou commençant ensuite.
     end_or_begin = df["date_end"].fillna(df["date_begin"])
-    mask_period = (end_or_begin >= date_min) & (df["date_begin"] <= date_max)
+    mask_period = end_or_begin >= date_min
     n_dropped_period = int((~mask_period).sum())
     if n_dropped_period:
         log.warning(
             "[3/8] Filtre période élimine %d événements "
-            "(date_end < %s OU date_begin > %s)",
-            n_dropped_period, date_min, date_max,
+            "(date_end < %s)",
+            n_dropped_period, date_min,
         )
     df = df[mask_period].copy()
     n3 = len(df)

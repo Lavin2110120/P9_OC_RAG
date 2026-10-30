@@ -4,7 +4,7 @@
 # commentaire sous chaque cible, ou bien `make` via WSL / Git-Bash.
 # =============================================================================
 
-.PHONY: help install install-dev install-ui install-all fetch clean-data vectorize pipeline api ui test evaluate docker-build docker-run docker-shell clean all
+.PHONY: help install install-dev install-ui install-all fetch clean-data vectorize pipeline api ui test evaluate docker-build docker-run docker-shell clean purge-data
 
 # ---------- Aide ----------
 help:
@@ -22,21 +22,22 @@ help:
 	@echo "  evaluate       : python -m scripts.evaluate_rag"
 	@echo "  docker-build   : docker build -t puls-events-rag ."
 	@echo "  docker-run     : docker run -p 8000:8000 --env-file .env puls-events-rag"
-	@echo "  clean          : supprime caches Python + __pycache__ + .pytest_cache"
+	@echo "  clean          : supprime caches Python + .pytest_cache + .coverage + *.csv"
+	@echo "  purge-data     : supprime le dossier data/ (refetch complet nécessaire)"
 
 # ---------- Installation ----------
 # PS> : pip install -e ".[core]"
 install:
-	pip install --upgrade pip
-	pip install -e ".[core]"
+	python -m pip install --upgrade pip
+	python -m pip install -e ".[core]"
 
 # PS> : pip install -e ".[core,dev]"
 install-dev: install
-	pip install -e ".[dev]"
+	python -m pip install -e ".[dev]"
 
 # PS> : pip install -e ".[ui]"
 install-ui: install
-	pip install -e ".[ui]"
+	python -m pip install -e ".[ui]"
 
 # PS> : pip install -e ".[core,dev,ui]"
 install-all: install-dev install-ui
@@ -76,7 +77,7 @@ streamlit: ui
 # ---------- Tests & évaluation ----------
 # PS> : pytest tests/ -v
 test:
-	pytest tests/ -v
+	pytest tests/ -v --tb=short --cov=scripts --cov=api --cov-report=term-missing
 
 # PS> : python -m scripts.evaluate_rag
 evaluate:
@@ -88,25 +89,20 @@ docker-build:
 	docker build -t puls-events-rag .
 
 # PS> : docker run -p 8000:8000 --env-file .env puls-events-rag
-# Monte data/ en volume pour persister l'index FAISS entre les rebuilds.
 docker-run:
-	docker run -p 8000:8000 --env-file .env \
-		-v $(PWD)/data:/app/data \
-		puls-events-rag
-
-# Ouvre un shell dans le conteneur pour debug
-docker-shell:
-	docker run --rm -it --env-file .env \
-		-v $(PWD)/data:/app/data \
-		--entrypoint /bin/bash \
-		puls-events-rag
+	docker run --rm -p 8000:8000 --env-file .env --mount "type=bind,source=$(CURDIR)/data,target=/app/data" puls-events-rag
 
 # ---------- Nettoyage ----------
+# PS> : python -c "..." (supprime caches, .pytest_cache, .coverage, *.csv)
 clean:
-	find . -type d -name "__pycache__" -exec rm -rf {} +
-	rm -rf .pytest_cache .mypy_cache .coverage htmlcov
-	rm -rf data/vector_store/*
-	rm -rf *.egg-info build dist
+	python -c "import pathlib, shutil; \
+	[shutil.rmtree(p) for p in pathlib.Path('.').rglob('__pycache__')]; \
+	[shutil.rmtree(p, ignore_errors=True) for p in [pathlib.Path('.pytest_cache'), pathlib.Path('.mypy_cache'), pathlib.Path('htmlcov'), pathlib.Path('build'), pathlib.Path('dist')]]; \
+	[shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('.').rglob('*.egg-info')]; \
+	[p.unlink(missing_ok=True) for p in pathlib.Path('.').glob('*.csv')]; \
+	[pathlib.Path(p).unlink(missing_ok=True) for p in ['.coverage']]"
 
-# ---------- Cible par défaut ----------
-all: pipeline test evaluate
+# Purge explicite des données (force un refetch complet) — attention, irréversible
+# PS> : powershell -Command "Remove-Item -Recurse -Force data"
+purge-data:
+	powershell -Command "Remove-Item -Recurse -Force data -ErrorAction SilentlyContinue"
