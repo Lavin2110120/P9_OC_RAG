@@ -27,16 +27,14 @@ RUN apt-get update \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copie pyproject.toml seul pour profiter du cache Docker des layers pip
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 
 # Installation des dépendances core (FastAPI, FAISS, Mistral, …)
 RUN pip install --no-cache-dir ".[core]"
 
 
-ARG EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 RUN python -c "from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer('${EMBEDDING_MODEL}', cache_folder='${HF_HOME}')" \
+    SentenceTransformer('BAAI/bge-m3', cache_folder='${HF_HOME}')" \
     && du -sh ${HF_HOME}
 
 # ---------- Stage 2 : runner (image finale légère) ----------
@@ -44,12 +42,12 @@ FROM python:3.12-slim AS runner
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/opt/hf_cache
+    HF_HOME=/opt/hf_cache \
+    SENTENCE_TRANSFORMERS_HOME=/opt/hf_cache
 
 WORKDIR /app
 
 # Dépendances runtime : libgomp1 pour OpenMP (faiss / sentence-transformers),
-# curl pour le HEALTHCHECK.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libgomp1 \
@@ -72,7 +70,6 @@ COPY scripts/  ./scripts/
 COPY ui/       ./ui/
 
 # Aucun secret (OPENAGENDA_API_KEY, MISTRAL_API_KEY) n'est copié dans l'image :
-# ils doivent être passés via --env-file .env ou -e au `docker run`.
 
 # Utilisateur non-root pour la sécurité
 RUN useradd --create-home --uid 1001 appuser \

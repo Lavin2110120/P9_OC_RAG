@@ -1,4 +1,4 @@
-"""API FastAPI : /health, /ask, /rebuild."""
+"""FastAPI API for health checks, RAG queries, and safe event-index rebuilds."""
 import asyncio
 import json
 import logging
@@ -17,55 +17,78 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
-
-from api.mistral_qa import generate_response
-from scripts.fetch_events import main as fetch_events_main
-from scripts.clean_events import main as clean_events_main
-from scripts.vectorize_events import main as vectorize_and_index
+from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
 
-# Fichier de persistance pour last_rebuild
+# Keep this module-level setting patchable for tests and deployments.
 LAST_REBUILD_FILE = PROJECT_ROOT / "data" / "last_rebuild.json"
 
-# État global de l'application
+# These wrappers preserve the module's existing patch points while ensuring
+# importing the API does not load transformer models, FAISS, or the LLM stack.
+def generate_response(query: str) -> str:
+    """Import the RAG stack only when an /ask request actually needs it."""
+    from .mistral_qa import generate_response as _generate_response
+
+    return _generate_response(query)
+
+
+def fetch_events_main() -> Any:
+    from scripts.fetch_events import main
+
+    return main()
+
+
+def clean_events_main() -> Any:
+    from scripts.clean_events import main
+
+    return main()
+
+
+def vectorize_and_index() -> Any:
+    from scripts.vectorize_events import main
+
+    return main()
+
+
 rebuild_lock = asyncio.Lock()
 scheduler = AsyncIOScheduler()
 last_rebuild: Optional[datetime] = None
 
 
 def save_last_rebuild() -> None:
-    """Persiste last_rebuild dans un fichier JSON."""
+    """Persist the last successful rebuild timestamp, if available."""
     try:
         LAST_REBUILD_FILE.parent.mkdir(parents=True, exist_ok=True)
-        data = {"last_rebuild": last_rebuild.isoformat() if last_rebuild else None}
-        LAST_REBUILD_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        logger.debug("last_rebuild persisté dans %s", LAST_REBUILD_FILE)
+        payload = {"last_rebuild": last_rebuild.isoformat() if last_rebuild else None}
+        LAST_REBUILD_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.debug("last_rebuild persisted to %s", LAST_REBUILD_FILE)
     except Exception as exc:
-        logger.warning("Impossible de persister last_rebuild : %s", exc)
+        # A persistence failure should be visible in logs but must not hide the
+        # successful pipeline result or crash the health/status endpoints.
+        logger.warning("Unable to persist last_rebuild: %s", exc)
 
 
 def load_last_rebuild() -> Optional[datetime]:
-    """Charge last_rebuild depuis le fichier JSON."""
+    """Load a persisted timestamp; absent, malformed, or invalid data means None."""
     try:
         if LAST_REBUILD_FILE.exists():
             data = json.loads(LAST_REBUILD_FILE.read_text(encoding="utf-8"))
-            raw_value = data.get("last_rebuild")
+            raw_value = data.get("last_rebuild") if isinstance(data, dict) else None
             if raw_value:
                 return datetime.fromisoformat(raw_value)
-    except Exception as exc:
-        logger.warning("Impossible de charger last_rebuild : %s", exc)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Unable to load last_rebuild: %s", exc)
     return None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestion du cycle de vie de l'application (startup/shutdown)."""
+    """Load persisted state and run the weekly rebuild scheduler lifecycle."""
     global last_rebuild
 
-    # Startup : charger l'état persisté et démarrer le scheduler
     last_rebuild = load_last_rebuild()
-    logger.info("last_rebuild chargé : %s", last_rebuild)
+    logger.info("Loaded last_rebuild: %s", last_rebuild)
 
     scheduler.add_job(
         scheduled_weekly_rebuild,
@@ -74,49 +97,50 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("Scheduler démarré - rebuild hebdomadaire configuré (lundi 3h)")
-
-    yield
-
-    # Shutdown : arrêter proprement le scheduler
-    scheduler.shutdown(wait=False)
-    logger.info("Scheduler arrêté")
+    logger.info("Weekly rebuild scheduler started (Monday 03:00)")
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler stopped")
 
 
 app = FastAPI(title="Puls Events API", version="1.0.0", lifespan=lifespan)
 
 
 async def run_full_pipeline_safe() -> Dict[str, Any]:
-    """Exécute le pipeline complet avec gestion du verrou et persistance."""
+    """Run the ordered pipeline once, report failures, and persist success."""
     global last_rebuild
 
+    # No await occurs between the check and acquiring an unlocked asyncio.Lock;
+    # this rejects overlapping invocations on the application's event loop.
     if rebuild_lock.locked():
-        logger.warning("Rebuild déjà en cours, ignoré")
+        logger.warning("A rebuild is already running; request ignored")
         return {"status": "already_running"}
 
     async with rebuild_lock:
         try:
-            logger.info("Début du rebuild automatique/manuel")
+            logger.info("Starting automatic/manual rebuild")
+            # Callable entry points (not shell commands) are deliberately used:
+            # arguments cannot be interpolated into a shell command.
             fetch_events_main()
             clean_events_main()
             vectorize_and_index()
 
             last_rebuild = datetime.now()
-            save_last_rebuild()  # Persistance immédiate
-
-            logger.info("Rebuild terminé avec succès à %s", last_rebuild)
+            save_last_rebuild()
+            logger.info("Rebuild completed at %s", last_rebuild)
             return {"status": "ok", "completed_at": last_rebuild.isoformat()}
-
         except Exception as exc:
-            logger.exception("Échec du rebuild : %s", exc)
+            logger.exception("Rebuild failed: %s", exc)
             return {"status": "error", "detail": str(exc)}
 
 
 async def scheduled_weekly_rebuild() -> None:
-    """Tâche appelée automatiquement toutes les semaines."""
-    logger.info("Lancement du rebuild hebdomadaire planifié")
+    """Scheduler entry point."""
+    logger.info("Starting scheduled weekly rebuild")
     result = await run_full_pipeline_safe()
-    logger.info("Résultat du rebuild hebdomadaire : %s", result)
+    logger.info("Scheduled rebuild result: %s", result)
 
 
 class QueryRequest(BaseModel):
@@ -125,10 +149,9 @@ class QueryRequest(BaseModel):
 
 @app.get("/health")
 async def health_check() -> Dict[str, Any]:
-    """Vérifie l'état de l'API et affiche les infos de planification."""
+    """Expose API and scheduler health information."""
     job = scheduler.get_job("weekly_rebuild")
     next_run = job.next_run_time if job else None
-
     return {
         "status": "OK",
         "message": "API opérationnelle",
@@ -139,46 +162,44 @@ async def health_check() -> Dict[str, Any]:
 
 @app.post("/ask")
 async def ask(request: QueryRequest) -> Dict[str, Any]:
-    """Génère une réponse à partir d'une requête utilisateur."""
+    """Generate an answer from the event index and LLM."""
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="La requête est vide.")
-
     try:
-        response = generate_response(request.query)
+        response = await run_in_threadpool(generate_response, request.query)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("Erreur /ask : %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
+    except Exception as exc:
+        logger.exception("Erreur /ask : %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"response": response}
 
 
 @app.post("/rebuild")
 async def rebuild(background_tasks: BackgroundTasks) -> Dict[str, Any]:
-    """Déclenche un rebuild en arrière-plan (non bloquant)."""
+    """Queue a non-blocking rebuild unless one is already running."""
     if rebuild_lock.locked():
         return {"status": "already_running", "message": "Un rebuild est déjà en cours"}
-
     background_tasks.add_task(run_full_pipeline_safe)
     return {"status": "success", "message": "Pipeline lancé en arrière-plan"}
 
 
 @app.post("/rebuild/now")
 async def rebuild_now() -> Dict[str, Any]:
-    """Déclenche un rebuild immédiat (bloquant, pour debug/test)."""
+    """Run the pipeline synchronously from the caller's perspective."""
     return await run_full_pipeline_safe()
 
 
 @app.get("/rebuild/status")
 async def rebuild_status() -> Dict[str, Any]:
-    """Retourne l'état détaillé du système de rebuild."""
+    """Report actual in-process rebuild and scheduler state."""
     job = scheduler.get_job("weekly_rebuild")
-
     return {
         "is_running": rebuild_lock.locked(),
         "last_rebuild": last_rebuild.isoformat() if last_rebuild else None,
-        "next_scheduled_rebuild": job.next_run_time.isoformat() if job and job.next_run_time else None,
+        "next_scheduled_rebuild": (
+            job.next_run_time.isoformat() if job and job.next_run_time else None
+        ),
         "scheduler_running": scheduler.running,
     }
 

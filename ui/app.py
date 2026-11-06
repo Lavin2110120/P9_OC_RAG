@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 DEFAULT_API_URL = "http://localhost:8000"
-API_TIMEOUT_SECONDS = 60
+API_TIMEOUT_SECONDS = 120
 
 
 def _response_text(payload: Any) -> str | None:

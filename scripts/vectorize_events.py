@@ -20,7 +20,6 @@ from config import settings
 
 log = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 def load_data(file_path: Path) -> pd.DataFrame:
@@ -59,13 +58,15 @@ def prepare_texts(df: pd.DataFrame) -> list[str]:
 
 def generate_embeddings(texts: list[str], model_name: str) -> np.ndarray:
     log.info("Chargement du modèle %s...", model_name)
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, device=settings.EMBEDDING_DEVICE)
+    model.max_seq_length = settings.EMBEDDING_MAX_SEQ_LENGTH
     log.info("Génération des embeddings...")
     return model.encode(
         texts,
-        batch_size=32,
+        batch_size=settings.EMBEDDING_BATCH_SIZE,
         show_progress_bar=True,
         convert_to_numpy=True,
+        normalize_embeddings=settings.EMBEDDING_NORMALIZE,
     ).astype("float32")
 
 
@@ -95,7 +96,7 @@ def main() -> None:
 
     texts = prepare_texts(df)
 
-    embeddings = generate_embeddings(texts, EMBEDDING_MODEL)
+    embeddings = generate_embeddings(texts, settings.EMBEDDING_MODEL)
 
     if embeddings.ndim != 2 or embeddings.shape[0] != len(df):
         raise ValueError(

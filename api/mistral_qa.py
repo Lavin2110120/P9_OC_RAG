@@ -47,10 +47,8 @@ def _get_localized_date() -> str:
         return datetime.now().strftime("%d %B %Y")
 
 
-AUJOURD_HUI = _get_localized_date()
-
-PROMPT_TEMPLATE = f"""
-Aujourd'hui, nous sommes le {AUJOURD_HUI}.
+PROMPT_TEMPLATE = """
+Aujourd'hui, nous sommes le {today}.
 
 Tu es un assistant pour la ville de Dijon. Réponds en français.
 Tu disposes d'extraits d'événements (contexte) : utilise-les pour répondre.
@@ -60,9 +58,9 @@ Ne suppose jamais de période temporelle si l'utilisateur ne la précise pas.
 Si tu vois des événements à différentes dates, liste-les tous sans filtrer.
 
 Contexte :
-{{context}}
+{context}
 
-Question : {{question}}
+Question : {question}
 
 Réponse (basée uniquement sur le contexte) :
 """
@@ -78,10 +76,11 @@ def generate_response(query: str, k: int = 5) -> str:
     """Interroge le système RAG et retourne la réponse du LLM."""
     retriever = FAISSRetriever.get_instance()
     retrieve_fn = partial(retriever.retrieve, k=k)
+    prompt = PROMPT.partial(today=_get_localized_date())
 
     chain = (
         {"context": RunnableLambda(retrieve_fn) | RunnableLambda(_format_docs),"question": RunnablePassthrough(),}
-        | PROMPT
+        | prompt
         | LLM
         | StrOutputParser()
     )

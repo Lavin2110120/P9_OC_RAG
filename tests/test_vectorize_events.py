@@ -1,4 +1,4 @@
-"""Tests de vectorize_events avec embeddings simulés."""
+"""Tests de vectorize_events avec modèle d'embeddings simulé."""
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -41,13 +41,25 @@ def test_prepare_texts_textes_vides_leve_valueerror():
         ve.prepare_texts(pd.DataFrame({"text": ["ok", "   "]}))
 
 
-def test_generate_embeddings_appelle_le_model_encode():
+def test_generate_embeddings_configure_le_modele_et_encode():
     mock_model = MagicMock()
     mock_model.encode.return_value = np.ones((2, 4), dtype="float64")
+    model_name = ve.settings.EMBEDDING_MODEL
     with patch("scripts.vectorize_events.SentenceTransformer",
                return_value=mock_model) as mock_st:
-        out = ve.generate_embeddings(["a", "b"], "mon-modele")
-    mock_st.assert_called_once_with("mon-modele")
+        out = ve.generate_embeddings(["a", "b"], model_name)
+
+    mock_st.assert_called_once_with(
+        model_name, device=ve.settings.EMBEDDING_DEVICE
+    )
+    assert mock_model.max_seq_length == ve.settings.EMBEDDING_MAX_SEQ_LENGTH
+    mock_model.encode.assert_called_once_with(
+        ["a", "b"],
+        batch_size=ve.settings.EMBEDDING_BATCH_SIZE,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=ve.settings.EMBEDDING_NORMALIZE,
+    )
     assert out.dtype == np.float32
     assert out.shape == (2, 4)
 
@@ -74,23 +86,32 @@ def test_save_index_et_save_metadata(tmp_path):
 
 def test_main_incoherence_embeddings_metadonnees_leve_valueerror():
     df = pd.DataFrame({"text": ["a", "b"]})  # 2 lignes
+    embeddings = np.ones((3, 4), dtype="float32")  # 3 vecteurs ≠ 2 lignes
     with patch("scripts.vectorize_events.load_data", return_value=df), \
          patch("scripts.vectorize_events.generate_embeddings",
-               return_value=np.ones((3, 4), dtype="float32")):  # 3 embeddings ≠ 2
+               return_value=embeddings) as generate_mock:
         with pytest.raises(ValueError, match="ne correspond pas"):
             ve.main()
+    generate_mock.assert_called_once_with(df["text"].tolist(), ve.settings.EMBEDDING_MODEL)
 
 
 def test_main_ok_ecrit_index_et_metadata(tmp_path):
     df = pd.DataFrame({"text": ["a", "b"]})
+    embeddings = np.ones((2, 4), dtype="float32")
     with patch("scripts.vectorize_events.load_data", return_value=df), \
          patch("scripts.vectorize_events.generate_embeddings",
-               return_value=np.ones((2, 4), dtype="float32")), \
-         patch.object(ve.settings, "VECTOR_STORE_DIR", tmp_path, create=True), \
-         patch.object(ve.settings, "INDEX_FILE",
-                      tmp_path / "index.bin", create=True), \
-         patch.object(ve.settings, "METADATA_FILE",
-                      tmp_path / "meta.parquet", create=True):
+               return_value=embeddings) as generate_mock, \
+         patch.object(ve.settings, "VECTOR_STORE_DIR", tmp_path), \
+         patch.object(ve.settings, "INDEX_FILE", tmp_path / "index.bin"), \
+         patch.object(ve.settings, "METADATA_FILE", tmp_path / "meta.parquet"):
         ve.main()
+
+    generate_mock.assert_called_once_with(df["text"].tolist(), ve.settings.EMBEDDING_MODEL)
     assert (tmp_path / "index.bin").exists()
     assert (tmp_path / "meta.parquet").exists()
+    index = ve.faiss.read_index(str(tmp_path / "index.bin"))
+    assert index.ntotal == 2
+    assert index.d == 4
+    pd.testing.assert_frame_equal(
+        pd.read_parquet(tmp_path / "meta.parquet"), df
+    )

@@ -19,7 +19,7 @@ help:
 	@echo "  api            : uvicorn api.main:app --reload"
 	@echo "  ui             : streamlit run ui/app.py"
 	@echo "  test           : pytest tests/ -v"
-	@echo "  evaluate       : python -m scripts.evaluate_rag"
+	@echo "  evaluate       : python evaluate_rag.py"
 	@echo "  docker-build   : docker build -t puls-events-rag ."
 	@echo "  docker-run     : docker run -p 8000:8000 --env-file .env puls-events-rag"
 	@echo "  clean          : supprime caches Python + .pytest_cache + .coverage + *.csv"
@@ -79,7 +79,7 @@ streamlit: ui
 test:
 	pytest tests/ -v --tb=short --cov=scripts --cov=api --cov-report=term-missing
 
-# PS> : python -m scripts.evaluate_rag
+# PS> : python evaluate_rag.py
 evaluate:
 	python -m tests.evaluate_rag
 

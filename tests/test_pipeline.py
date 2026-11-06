@@ -88,7 +88,7 @@ def test_clean_events_end_to_end(tmp_path):
 
 
 # ===================== tests faiss_retriever (mockés) =====================
-MOCK_EMBEDDING_DIM = 384  # mock du modèle configuré dans api.faiss_retriever
+MOCK_EMBEDDING_DIM = 1024  # dimension de BAAI/bge-m3 configuré dans le retriever
 
 
 @pytest.fixture
@@ -103,7 +103,7 @@ def mock_retriever_env():
          patch("api.faiss_retriever.pd.read_parquet") as mock_meta, \
          patch("api.faiss_retriever.SentenceTransformer") as mock_st:
         # Index FAISS simulé
-        idx_mock = MagicMock(ntotal=2)
+        idx_mock = MagicMock(ntotal=2, d=MOCK_EMBEDDING_DIM)
         mock_index.return_value = idx_mock
 
         # Le code ne lit dans les métadonnées que ces champs.
@@ -166,11 +166,11 @@ def test_retrieve_handles_negative_index(mock_retriever_env):
 
 
 def test_retriever_init_rejects_index_metadata_count_mismatch(mock_retriever_env):
-    """Le code fourni valide le compte de vecteurs, pas la dimension."""
+    """Le code valide le compte de vecteurs et la dimension de la requête par rapport à l’index."""
     from api.faiss_retriever import FAISSRetriever
 
     FAISSRetriever._instance = None
-    mock_idx = MagicMock(ntotal=3)
+    mock_idx = MagicMock(ntotal=3, d=MOCK_EMBEDDING_DIM)
     with patch("api.faiss_retriever.faiss.read_index", return_value=mock_idx):
         with pytest.raises(ValueError, match="Incohérence : index=3 vecteurs"):
             FAISSRetriever()
@@ -179,7 +179,7 @@ def test_retriever_init_rejects_index_metadata_count_mismatch(mock_retriever_env
 def test_retrieve_latence_unitaire_avec_dependances_mockees(mock_retriever_env):
     """Mesure le retrieval avec index/modèle entièrement simulés.
 
-    Ce test rapide ne mesure ni l'inférence BGE-small, ni FAISS réel, ni le RAG.
+    Ce test rapide ne mesure ni l'inférence BGE-M3, ni FAISS réel, ni le RAG.
     """
     try:
         limite = float(os.getenv("PIPELINE_MOCK_RETRIEVE_MAX_SECONDS", "2.0"))

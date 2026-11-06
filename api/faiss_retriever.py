@@ -8,14 +8,12 @@ import numpy as np
 import pandas as pd
 from langchain_core.documents import Document
 from sentence_transformers import SentenceTransformer
+import os
+
 
 from config import settings
 
 logger = logging.getLogger(__name__)
-
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
-EMBEDDING_DEVICE = "cpu"
-
 
 class FAISSRetriever:
     """Singleton chargeant l'index FAISS et les métadonnées au démarrage."""
@@ -43,10 +41,14 @@ class FAISSRetriever:
         if "uid" in self.metadata_df.columns:
             self.metadata_df["uid"] = self.metadata_df["uid"].astype(str)
 
-        logger.info(
-            "FAISSRetriever prêt : %d vecteurs, %d lignes de métadonnées.",
-            self.index.ntotal, len(self.metadata_df),
+        logger.info("Chargement du modèle d'embeddings...")
+        self.model = SentenceTransformer(
+            settings.EMBEDDING_MODEL,
+            device=settings.EMBEDDING_DEVICE,
+            cache_folder=os.getenv("SENTENCE_TRANSFORMERS_HOME"),
         )
+        self.model.max_seq_length = settings.EMBEDDING_MAX_SEQ_LENGTH
+        logger.info("Modèle d'embeddings prêt.")
 
     @property
     def metadata(self) -> pd.DataFrame:
@@ -62,10 +64,20 @@ class FAISSRetriever:
         if k <= 0 or self.index.ntotal == 0:
             return []
 
-        model = SentenceTransformer(MODEL_NAME, device=EMBEDDING_DEVICE)
-        query_embedding = model.encode([query], convert_to_numpy=True).astype("float32")
+        query_embedding = self.model.encode(
+            [query],
+            convert_to_numpy=True,
+            normalize_embeddings=settings.EMBEDDING_NORMALIZE,
+        ).astype("float32")
         if query_embedding.ndim == 1:
             query_embedding = query_embedding.reshape(1, -1)
+
+        if query_embedding.shape[1] != self.index.d:
+            raise ValueError(
+                f"Dimension incompatible : requête={query_embedding.shape[1]}, "
+                f"index={self.index.d}. Reconstruisez l'index avec "
+                f"{settings.EMBEDDING_MODEL}."
+            )
 
         k_effective = min(k, self.index.ntotal)
         distances, indices = self.index.search(query_embedding, k_effective)
