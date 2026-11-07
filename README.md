@@ -113,8 +113,6 @@ Le pipeline n’applique pas de découpage textuel supplémentaire. Chaque évé
 
 Le script de vectorisation encode le texte construit par le nettoyage avec `BAAI/bge-m3`, en lots de **16**, convertit les vecteurs en `float32` et les ajoute à un `faiss.IndexFlatL2`. BGE-M3 produit des embeddings denses de **1024 dimensions**. La configuration limite la longueur des séquences à 512 tokens pour maîtriser l’usage mémoire (le modèle peut accepter des séquences plus longues) et normalise les vecteurs avant indexation et recherche. Aucun préfixe d’instruction propre à BGE-Small n’est ajouté aux requêtes. Après ce changement de modèle, relancez `make vectorize` (après avoir le Parquet nettoyé) pour reconstruire index et métadonnées avant de lancer l’API.
 
-L’index FAISS fourni a **384 dimensions** et est donc incompatible avec les vecteurs BGE-M3 de **1024 dimensions**. Il faut reconstruire l’index et ses métadonnées avec le nouveau modèle avant d’utiliser le retriever ; les vecteurs de l’ancien index ne peuvent pas être convertis en changeant simplement sa dimension. Le code signale désormais explicitement un désaccord de dimensions.
-
 Le nettoyage crée un champ `text` et le vectoriseur le réutilise directement : le texte des métadonnées enregistrées est donc celui que le script encode. Le retriever vérifie la présence de ce champ et l’égalité entre le nombre de lignes de métadonnées et de vecteurs. Cette vérification ne prouve pas, à elle seule, l’alignement sémantique de chaque ligne et de chaque vecteur, ni la provenance de l’index.
 
 ## 4. Choix du modèle NLP
